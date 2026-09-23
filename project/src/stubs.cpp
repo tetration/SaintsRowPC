@@ -1,0 +1,700 @@
+// Saints Row - game-specific overrides of recompiled guest functions and
+// kernel exports.
+//
+// PPC_FUNC(sub_X) replaces the recompiled function sub_X; the original body
+// remains callable as __imp__sub_X. PPC_FUNC_IMPL(__imp__Name) replaces the
+// SDK's implementation of a kernel import.
+
+#include "saintsrow_config.h"
+#include "saintsrow_init.h"
+
+#include <rex/graphics/graphics_system.h>
+#include <rex/ppc/function.h>
+#include <rex/runtime.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/xevent.h>
+#include <rex/system/xsemaphore.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+namespace {
+
+// Host pointer for a guest virtual address. The 0xE0000000 heap sits 4 KB
+// further into host memory, matching what the recompiled code does.
+inline uint8_t* GuestPtr(uint8_t* base, uint32_t addr) {
+    return base + addr + (addr >= 0xE0000000u ? 0x1000u : 0u);
+}
+
+// Big-endian 32-bit guest read that honours the 0xE0000000 host offset.
+inline uint32_t GRd32(uint8_t* base, uint32_t addr) {
+    return __builtin_bswap32(*reinterpret_cast<volatile uint32_t*>(GuestPtr(base, addr)));
+}
+
+// True if `addr` lies inside the game executable's code/data image.
+inline bool IsGuestImageAddress(uint32_t addr) {
+    return addr >= 0x82000000u && addr < 0x83000000u;
+}
+
+}  // namespace
+
+// ============================================================================
+// XAM user / content stubs
+// ============================================================================
+
+// Report user 0 as signed in locally so the game proceeds past its sign-in check.
+extern "C" uint32_t XamUserGetSigninState_entry(uint32_t user_index) {
+    if (user_index == 0) return 1;  // eSignedInLocally
+    return 0;                       // eNotSignedIn
+}
+
+// Return a zeroed sign-in info block; the game falls back to defaults.
+extern "C" void XamUserGetSigninInfo_entry(uint32_t user_index, uint32_t flags, void* info_ptr) {
+    if (info_ptr) {
+        memset(info_ptr, 0, 0x100);
+    }
+}
+
+// Report every content license bit as granted.
+extern "C" uint32_t XamContentGetLicenseMask_entry(uint32_t* mask_ptr, void* overlapped) {
+    if (mask_ptr) *mask_ptr = 0xFFFFFFFF;
+    return 0;  // X_ERROR_SUCCESS
+}
+
+// ============================================================================
+// Main loop / frame flags
+// ============================================================================
+
+// Device state that must be set for a frame to reach VdSwap: clear the
+// swap-skip flag, mark the frame dirty, keep the frame counter non-zero and
+// set the D3D "direct" bit that gates the ring-buffer kick.
+static void ForceFrameFlags(uint8_t* base, uint32_t dev) {
+    PPC_STORE_U32(dev + 19980, 0);
+    PPC_STORE_U8(dev + 20424, PPC_LOAD_U8(dev + 20424) | 0x8);
+    if (PPC_LOAD_U32(dev + 20080) == 0) {
+        PPC_STORE_U32(dev + 20080, 1);
+    }
+    PPC_STORE_U8(dev + 10809, PPC_LOAD_U8(dev + 10809) | 0x2);
+}
+
+// Present: force the frame flags on the device (r3) before the real call.
+extern "C" void __imp__sub_825E54A8(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_825E54A8) {
+    const uint32_t dev = ctx.r3.u32;
+    if (dev) {
+        ForceFrameFlags(base, dev);
+    }
+    __imp__sub_825E54A8(ctx, base);
+}
+
+// Per-frame render entry (GL2_Render). The flags at 0x8370E9DF/0x8370E9F6
+// gate an indirect call through [0x8370F248]; clear them while that pointer
+// is not valid code. Afterwards force the frame flags on the global device.
+extern "C" void __imp__sub_8262FFE0(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_8262FFE0) {
+    if (!IsGuestImageAddress(PPC_LOAD_U32(0x8370F248))) {
+        PPC_STORE_U8(0x8370E9DF, 0);
+        PPC_STORE_U8(0x8370E9F6, 0);
+    }
+    __imp__sub_8262FFE0(ctx, base);
+    ForceFrameFlags(base, 0x40001E00);
+}
+
+// Main game loop: same function-pointer gate as above, checked on entry.
+extern "C" void __imp__sub_82185498(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_82185498) {
+    if (!IsGuestImageAddress(PPC_LOAD_U32(0x8370F248))) {
+        PPC_STORE_U8(0x8370E9DF, 0);
+    }
+    __imp__sub_82185498(ctx, base);
+}
+
+// Physics update: skipped (returns 0).
+PPC_FUNC(sub_8234C1C0) {
+    ctx.r3.u64 = 0;
+}
+
+// Post-loop callback dispatch blocks on a critical section; return 0 instead.
+PPC_FUNC(sub_82604C10) {
+    ctx.r3.u64 = 0;
+}
+
+// ============================================================================
+// GPU command submission
+// ============================================================================
+//
+// The game's D3D writes command segments and INDIRECT_BUFFER packets into the
+// primary ring. This port does not execute the ring; instead each command
+// buffer is handed to the command processor with SubmitCommandStream() at the
+// point D3D queues it (sub_825D3218), which preserves D3D's ordering relative
+// to predicated-tiling replays.
+
+// Ring buffer / render-state init. The main loop re-enters it every frame,
+// but it must run once: later calls return the first call's result. After the
+// real init, copy the primary ring's ME_INIT header to its physical backing,
+// zero the rest, and register the ring and read-pointer write-back with the GPU.
+extern "C" void __imp__sub_825D3DA8(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_825D3DA8) {
+    static bool init_done = false;
+    static uint32_t cached_ret = 0;
+    if (init_done) {
+        ctx.r3.u32 = cached_ret;
+        return;
+    }
+    init_done = true;
+
+    const uint32_t dev = ctx.r3.u32;
+    __imp__sub_825D3DA8(ctx, base);
+    cached_ret = ctx.r3.u32;
+
+    const uint32_t rptr_writeback = PPC_LOAD_U32(dev + 10768);
+    const uint32_t ring = PPC_LOAD_U32(dev + 13436);
+    if (ring == 0) {
+        return;
+    }
+    auto* ks = REX_KERNEL_STATE();
+    auto* gs = ks->emulator()->graphics_system();
+    const uint32_t ring_phys = ks->memory()->GetPhysicalAddress(ring);
+    if (ring_phys == UINT32_MAX) {
+        return;
+    }
+    constexpr uint32_t kRingBytes = 0x8000;
+    constexpr uint32_t kMeInitBytes = 31 * 4;
+    uint8_t* ring_virt_host = ks->memory()->TranslateVirtual(ring);
+    uint8_t* ring_phys_host = ks->memory()->TranslatePhysical(ring_phys);
+    if (ring_virt_host && ring_phys_host) {
+        memcpy(ring_phys_host, ring_virt_host, kMeInitBytes);
+        memset(ring_phys_host + kMeInitBytes, 0, kRingBytes - kMeInitBytes);
+    }
+    gs->InitializeRingBuffer(ring_phys, 12);
+    if (rptr_writeback) {
+        const uint32_t wb_phys = ks->memory()->GetPhysicalAddress(rptr_writeback);
+        if (wb_phys != UINT32_MAX) {
+            gs->EnableReadPointerWriteBack(wb_phys, 6);
+        }
+    }
+}
+
+// Segment kick: run it with the device's "direct" bit (device+10809 & 0x2)
+// cleared. With the bit set, D3D writes the segment's completion fence from
+// the CPU at kick time and recycles memory the GPU has not executed yet;
+// cleared, the fence is written by the segment itself when it executes.
+extern "C" void __imp__sub_825D3580(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_825D3580) {
+    volatile uint8_t* flags = GuestPtr(base, ctx.r3.u32) + 10809;
+    const uint8_t saved = *flags;
+    const bool clear = (saved & 0x2u) != 0;
+    if (clear) *flags = uint8_t(saved & ~0x2u);
+    __imp__sub_825D3580(ctx, base);
+    if (clear) *flags = uint8_t(*flags | 0x2u);
+}
+
+// Number of indirect buffers submitted so far (progress signal for the
+// tiling executor spin-break below).
+static std::atomic<uint32_t> g_submitted_ibs{0};
+
+// Queue an INDIRECT_BUFFER: instead of writing it into the primary ring,
+// execute it on the command processor. r4 points to {dword count, GPU address}.
+PPC_FUNC(sub_825D3218) {
+    const uint32_t desc = ctx.r4.u32;
+    const uint32_t dwords = GRd32(base, desc + 0);
+    const uint32_t gpu_addr = GRd32(base, desc + 4);
+    auto* ks = REX_KERNEL_STATE();
+    if (dwords && dwords < 0x400000u) {
+        const uint8_t* host = ks->memory()->TranslatePhysical(gpu_addr & 0x1FFFFFFFu);
+        ks->emulator()->graphics_system()->SubmitCommandStream(host, dwords * 4u);
+    }
+    g_submitted_ibs.fetch_add(1);
+}
+
+// Tile select: the deferred tiling executor writes SET_BIN_SELECT packets
+// straight into the primary ring. Forward whatever this call appended to the
+// ring to the command processor, in order with the submitted IBs.
+extern "C" void __imp__sub_825DF0B8(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_825DF0B8) {
+    const uint32_t dev = GRd32(base, GRd32(base, 0x82000658u));
+    const uint32_t wptr_before = dev ? GRd32(base, dev + 10820) : 0u;
+    __imp__sub_825DF0B8(ctx, base);
+    if (!dev) {
+        return;
+    }
+    const uint32_t wptr_after = GRd32(base, dev + 10820);
+    if (wptr_after == wptr_before) {
+        return;
+    }
+    const uint32_t ring = GRd32(base, dev + 13496);
+    const uint32_t mask = GRd32(base, dev + 13500);
+    uint32_t words[16];
+    uint32_t n = 0;
+    for (uint32_t w = wptr_before; w != wptr_after && n < 16; w = (w + 1) & mask) {
+        words[n++] = __builtin_bswap32(GRd32(base, ring + (w << 2)));  // keep guest (BE) layout
+    }
+    REX_KERNEL_STATE()->emulator()->graphics_system()->SubmitCommandStream(
+        reinterpret_cast<const uint8_t*>(words), n * 4u);
+}
+
+// End of a predicated-tiling pass: builds and queues the per-tile replay.
+// With the "direct" bit set D3D skips the replay entirely, so run it with the
+// bit cleared (restoring it afterwards).
+extern "C" void __imp__sub_825DFBF8(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_825DFBF8) {
+    const uint32_t dev = ctx.r3.u32;
+    if (!dev) {
+        __imp__sub_825DFBF8(ctx, base);
+        return;
+    }
+    volatile uint8_t* flags = GuestPtr(base, dev) + 10809;
+    const uint8_t saved = *flags;
+    *flags = uint8_t(saved & ~0x2u);
+    __imp__sub_825DFBF8(ctx, base);
+    *flags = uint8_t(*flags | (saved & 0x2u));
+}
+
+// ============================================================================
+// Deferred tiling executor guards
+// ============================================================================
+//
+// D3D's deferred tiling executor (sub_825DF708) walks task lists stored in
+// command-buffer memory. Because the port runs D3D in "direct" mode, that
+// memory can be handed out again before the executor has read it.
+
+namespace {
+std::atomic<int> g_exec_inside{0};        // threads inside sub_825DF708
+std::atomic<int> g_exec_end_wait{0};      // threads inside sub_825DF548
+std::atomic<uint32_t> g_exec_state{0};    // executor state struct (last seen)
+thread_local int t_in_exec = 0;
+}  // namespace
+
+// New command segment: before handing out segment memory, wait (at most
+// 50 ms) until the executor has taken every pending list and is idle or
+// parked at the end of its list. Skipped on the executor's own thread.
+extern "C" void __imp__sub_825D2F70(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_825D2F70) {
+    if (t_in_exec == 0) {
+        const auto t0 = std::chrono::steady_clock::now();
+        uint32_t spins = 0;
+        for (;;) {
+            const uint32_t state = g_exec_state.load();
+            const uint32_t pending = state ? GRd32(base, state + 80) : 0u;
+            const int inside = g_exec_inside.load();
+            const int end_wait = g_exec_end_wait.load();
+            if (pending == 0 && (inside == 0 || end_wait > 0)) break;
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(50)) break;
+            if (++spins > 64) {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            } else {
+                std::this_thread::yield();
+            }
+        }
+    }
+    __imp__sub_825D2F70(ctx, base);
+}
+
+// Executor entry: record its state struct and that it is running.
+extern "C" void __imp__sub_825DF708(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_825DF708) {
+    g_exec_state.store(GRd32(base, ctx.r3.u32));
+    g_exec_inside.fetch_add(1);
+    ++t_in_exec;
+    __imp__sub_825DF708(ctx, base);
+    --t_in_exec;
+    g_exec_inside.fetch_sub(1);
+}
+
+// Executor end-of-list wait: record that the executor is parked here.
+extern "C" void __imp__sub_825DF548(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_825DF548) {
+    g_exec_end_wait.fetch_add(1);
+    __imp__sub_825DF548(ctx, base);
+    g_exec_end_wait.fetch_sub(1);
+}
+
+// Executor step: a clobbered task list can make the executor call this
+// forever at the same position. After 20000 consecutive calls with no
+// progress, return a pointer to a 0xC0000000 terminator so the list ends.
+extern "C" void __imp__sub_825DF2C0(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_825DF2C0) {
+    const uint32_t ibs_before = g_submitted_ibs.load();
+    const uint32_t in_pos = ctx.r3.u32;
+    __imp__sub_825DF2C0(ctx, base);
+
+    thread_local uint32_t last_in = 0, stuck = 0;
+    const bool no_progress = (g_submitted_ibs.load() == ibs_before) && (in_pos == last_in);
+    last_in = in_pos;
+    stuck = no_progress ? stuck + 1 : 0;
+    if (stuck >= 20000) {
+        static uint32_t terminator = 0;
+        if (!terminator) {
+            terminator = REX_KERNEL_STATE()->memory()->SystemHeapAlloc(16);
+            if (terminator) {
+                *(volatile uint32_t*)(base + terminator) = __builtin_bswap32(0xC0000000u);
+                *(volatile uint32_t*)(base + terminator + 4) = __builtin_bswap32(0xC0000000u);
+            }
+        }
+        if (terminator) ctx.r3.u64 = terminator;
+        stuck = 0;
+    }
+}
+
+// Tile-bounds consumer: walks a chain of screen-bound record blocks (r4)
+// terminated by 0xC0000000.
+//  1. Validate the chain first and cut it at the first bad link, since a
+//     broken link would make the walk run forever; skip the call entirely if
+//     the first block is bad.
+//  2. Copy completed extent results from each record's physical (GPU-written)
+//     view to its virtual view, which is what the CPU code reads.
+extern "C" void __imp__sub_825DF608(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_825DF608) {
+    auto IsBadBlock = [](uint32_t block, uint32_t end) {
+        return end < block + 4 || end - block > 0x100000 || ((end - block - 4) & 15);
+    };
+
+    uint32_t link = 0;
+    for (uint32_t b = ctx.r4.u32, count = 0; b != 0xC0000000u; ++count) {
+        const bool plausible = b >= 0x40000000u && (b & 3u) == 0 && count < 4096;
+        const uint32_t end = plausible ? GRd32(base, b) : 0u;
+        if (!plausible || IsBadBlock(b, end)) {
+            if (!link) {
+                return;  // first block is bad: nothing to walk
+            }
+            *(volatile uint32_t*)GuestPtr(base, link) = __builtin_bswap32(0xC0000000u);
+            break;
+        }
+        link = end;
+        b = GRd32(base, end);
+    }
+
+    auto* memory = REX_KERNEL_STATE()->memory();
+    uint32_t block = ctx.r4.u32;
+    for (uint32_t blocks = 0; block && block != 0xC0000000u && blocks < 256; ++blocks) {
+        const uint32_t end = GRd32(base, block);
+        if (IsBadBlock(block, end)) break;
+        for (uint32_t record = block + 4; record < end; record += 16) {
+            const uint32_t va = record + 4;
+            const uint32_t pa = memory->GetPhysicalAddress(va);
+            if (pa == UINT32_MAX) continue;
+            auto* cpu = memory->TranslateVirtual<uint8_t*>(va);
+            const auto* gpu = memory->TranslatePhysical<const uint8_t*>(pa);
+            // Completed extent result: minX=0/maxX=1024/minY=0/maxY=1024 (BE halfwords).
+            const uint8_t expected[12] = {0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 0, 1};
+            if (!std::memcmp(gpu, expected, sizeof(expected)) &&
+                std::memcmp(cpu, gpu, sizeof(expected))) {
+                std::memcpy(cpu, gpu, sizeof(expected));
+            }
+        }
+        const uint32_t next = GRd32(base, end);
+        if (next == block) break;
+        block = next;
+    }
+    __imp__sub_825DF608(ctx, base);
+}
+
+// ============================================================================
+// Kernel object overrides
+// ============================================================================
+
+namespace rex { namespace kernel { namespace xboxkrnl {
+    extern void KeInitializeSemaphore_entry(ppc_ptr_t<rex::system::X_KSEMAPHORE>, uint32_t, uint32_t);
+    extern void KeInitializeEvent_entry(ppc_ptr_t<rex::system::X_KEVENT>, uint32_t, uint32_t);
+    extern uint32_t ExCreateThread_entry(mapped_u32, uint32_t, mapped_u32, uint32_t, mapped_void,
+                                         mapped_void, uint32_t);
+}}}
+
+// The game re-initializes its IO semaphores and events in place, overwriting
+// the dispatch header's wait-list words that the SDK uses to associate the
+// guest object with its native object. The SDK would then create a new native
+// object while existing threads still wait on the old one. Remember the
+// wait-list words from the first initialization and restore them on re-init
+// so the original native object keeps being used.
+namespace {
+struct TrackedObject {
+    uint32_t addr;
+    uint32_t wait_list_flink;
+    uint32_t wait_list_blink;
+};
+constexpr int kMaxTrackedObjects = 32;
+TrackedObject g_tracked_sems[kMaxTrackedObjects] = {};
+int g_tracked_sem_count = 0;
+TrackedObject g_tracked_events[kMaxTrackedObjects] = {};
+int g_tracked_event_count = 0;
+}  // namespace
+
+// KeInitializeSemaphore: on re-init keep the native object and set the count
+// (a requested count of 0 becomes 2, one per IO thread, so waiting IO threads
+// wake up and look for new work).
+PPC_FUNC_IMPL(__imp__KeInitializeSemaphore) {
+    const uint32_t sem_addr = ctx.r3.u32;
+    const uint32_t count = ctx.r4.u32;
+
+    for (int i = 0; i < g_tracked_sem_count; i++) {
+        if (g_tracked_sems[i].addr == sem_addr) {
+            PPC_STORE_U32(sem_addr + 8, g_tracked_sems[i].wait_list_flink);
+            PPC_STORE_U32(sem_addr + 12, g_tracked_sems[i].wait_list_blink);
+            PPC_STORE_U32(sem_addr + 4, (count == 0) ? 2 : count);  // signal_state
+            return;
+        }
+    }
+
+    HostToGuestFunction<rex::kernel::xboxkrnl::KeInitializeSemaphore_entry>(ctx, base);
+    if (g_tracked_sem_count < kMaxTrackedObjects) {
+        g_tracked_sems[g_tracked_sem_count++] = {sem_addr, PPC_LOAD_U32(sem_addr + 8),
+                                                 PPC_LOAD_U32(sem_addr + 12)};
+    }
+}
+
+// KeInitializeEvent: on re-init let the SDK reinitialize, then restore the
+// original association and the requested signal state.
+PPC_FUNC_IMPL(__imp__KeInitializeEvent) {
+    const uint32_t evt_addr = ctx.r3.u32;
+    const uint32_t initial_state = ctx.r5.u32;
+
+    for (int i = 0; i < g_tracked_event_count; i++) {
+        if (g_tracked_events[i].addr == evt_addr) {
+            HostToGuestFunction<rex::kernel::xboxkrnl::KeInitializeEvent_entry>(ctx, base);
+            PPC_STORE_U32(evt_addr + 8, g_tracked_events[i].wait_list_flink);
+            PPC_STORE_U32(evt_addr + 12, g_tracked_events[i].wait_list_blink);
+            PPC_STORE_U32(evt_addr + 4, initial_state);  // signal_state
+            return;
+        }
+    }
+
+    HostToGuestFunction<rex::kernel::xboxkrnl::KeInitializeEvent_entry>(ctx, base);
+    if (g_tracked_event_count < kMaxTrackedObjects) {
+        g_tracked_events[g_tracked_event_count++] = {evt_addr, PPC_LOAD_U32(evt_addr + 8),
+                                                     PPC_LOAD_U32(evt_addr + 12)};
+    }
+}
+
+// Set while sub_8260CC50 runs in thread-reuse mode (see below).
+static std::atomic<bool> g_skip_thread_creation{false};
+static uint32_t g_io_thread_handles[8] = {};
+static int g_io_thread_handle_count = 0;
+
+// ExCreateThread: remember the first 8 thread handles created. While
+// g_skip_thread_creation is set, hand out one of those (round-robin) instead
+// of creating a thread; the caller only references, re-prioritizes and resumes
+// it, which is harmless on a running thread.
+PPC_FUNC_IMPL(__imp__ExCreateThread) {
+    const uint32_t handle_out_addr = ctx.r3.u32;
+
+    if (g_skip_thread_creation.load()) {
+        if (g_io_thread_handle_count > 0 && handle_out_addr) {
+            static int reuse_idx = 0;
+            const uint32_t handle = g_io_thread_handles[reuse_idx % g_io_thread_handle_count];
+            reuse_idx++;
+            PPC_STORE_U32(handle_out_addr, handle);
+            ctx.r3.u64 = 0;  // success
+        } else {
+            ctx.r3.s64 = -1;
+        }
+        return;
+    }
+
+    HostToGuestFunction<rex::kernel::xboxkrnl::ExCreateThread_entry>(ctx, base);
+    if (ctx.r3.u32 == 0 && handle_out_addr && g_io_thread_handle_count < 8) {
+        const uint32_t new_handle = PPC_LOAD_U32(handle_out_addr);
+        if (new_handle) {
+            g_io_thread_handles[g_io_thread_handle_count++] = new_handle;
+        }
+    }
+}
+
+// XAudio engine creation. It is called repeatedly and creates worker threads
+// each time; after 200 re-creations, reuse existing thread handles instead of
+// creating more threads, which otherwise ends in STATUS_NO_MEMORY.
+extern "C" void __imp__sub_8260CC50(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_8260CC50) {
+    static bool first_call_done = false;
+    if (!first_call_done) {
+        first_call_done = true;
+        __imp__sub_8260CC50(ctx, base);
+        return;
+    }
+    static int real_count = 0;
+    const bool reuse = (real_count >= 200);
+    if (reuse) {
+        g_skip_thread_creation.store(true);
+    } else {
+        real_count++;
+    }
+    __imp__sub_8260CC50(ctx, base);
+    if (reuse) {
+        g_skip_thread_creation.store(false);
+    }
+}
+
+// Route the NtAllocateVirtualMemory import thunk directly to the kernel export.
+extern "C" void __imp__NtAllocateVirtualMemory(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_827893D4) {
+    __imp__NtAllocateVirtualMemory(ctx, base);
+}
+
+// XamLoaderTerminateTitle: never let the game terminate the title itself; the
+// calling thread is parked instead.
+PPC_FUNC(sub_82789084) {
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+}
+
+// ============================================================================
+// Streaming / loading
+// ============================================================================
+
+// Streaming work finder. Some callers pass a small sentinel value (e.g.
+// 0x0000000F, 0x04000000) instead of a pointer, which the real function
+// dereferences and hangs on: return 0 for anything below 0x10000000.
+// Callers poll this in a tight loop, so after the first 50 calls on either
+// path each call sleeps 1 ms to leave CPU time for other threads.
+extern "C" void __imp__sub_8265F4F0(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_8265F4F0) {
+    const uint32_t filter = ctx.r3.u32;
+    if (filter != 0 && filter < 0x10000000u) {
+        ctx.r3.u64 = 0;
+        static std::atomic<long long> rejected_calls{0};
+        if (++rejected_calls > 50) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return;
+    }
+
+    __imp__sub_8265F4F0(ctx, base);
+    static std::atomic<long long> calls{0};
+    if (++calls > 50) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+// "Is this object finished?" check used by the post-"Begin Game" loader loop.
+// The objects are sounds whose playback never completes in this port, so the
+// loader would wait forever: once an object has reported busy for more than
+// 6 seconds straight, report it as done.
+extern "C" void __imp__sub_82105B18(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_82105B18) {
+    const uint32_t obj = ctx.r3.u32;
+    __imp__sub_82105B18(ctx, base);
+    const bool done = (ctx.r3.u32 & 0xFF) != 0;
+
+    static std::mutex m;
+    static std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> busy_since;
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(m);
+    if (done) {
+        busy_since.erase(obj);
+        return;
+    }
+    auto it = busy_since.find(obj);
+    if (it == busy_since.end()) {
+        busy_since[obj] = now;
+    } else if (now - it->second > std::chrono::seconds(6)) {
+        ctx.r3.u64 = 1;
+    }
+}
+
+// ============================================================================
+// Null-pointer guards
+// ============================================================================
+// These guest functions are regularly handed null (or near-null) pointers.
+// The original code would read through them, which the null-page exception
+// handler recovers from at the cost of an OS exception per access -- often
+// thousands per second. Each guard returns the same result the recovered
+// read would have produced, without taking the fault.
+
+// strcmp-style compare (r3, r4): a null operand compares as "not equal".
+extern "C" void __imp__sub_826FE350(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_826FE350) {
+    if (ctx.r3.u32 < 0x10000u || ctx.r4.u32 < 0x10000u) {
+        ctx.r3.u64 = 1;
+        return;
+    }
+    __imp__sub_826FE350(ctx, base);
+}
+
+// strncpy(dest = r3, src = r4, n = r5): a null source copies an empty string,
+// i.e. zero-fills the destination. Returns dest in r3, as the original does.
+extern "C" void __imp__sub_826FE160(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_826FE160) {
+    if (ctx.r5.u32 != 0 && ctx.r4.u32 < 0x10000u) {
+        std::memset(GuestPtr(base, ctx.r3.u32), 0, ctx.r5.u32);
+        return;
+    }
+    __imp__sub_826FE160(ctx, base);
+}
+
+// strchr-style scan of r3: a null string yields "not found".
+extern "C" void __imp__sub_826FFD30(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_826FFD30) {
+    if (ctx.r3.u32 < 0x10000u) {
+        ctx.r3.u64 = 0;
+        return;
+    }
+    __imp__sub_826FFD30(ctx, base);
+}
+
+// String append helper (object r3, string r4): a null string appends nothing
+// and returns 0, the same result as its early-out path.
+extern "C" void __imp__sub_82643170(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_82643170) {
+    if (ctx.r4.u32 == 0) {
+        ctx.r3.u64 = 0;
+        return;
+    }
+    __imp__sub_82643170(ctx, base);
+}
+
+// Resource-cache find-or-insert keyed by r3. Key 0 is never a valid id, but
+// the original would insert it by rewriting the tree's shared sentinel node,
+// corrupting the cache for every other user. Report "no slot" instead.
+extern "C" void __imp__sub_82106580(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_82106580) {
+    if (ctx.r3.u32 == 0) {
+        ctx.r3.u64 = 0;
+        return;
+    }
+    __imp__sub_82106580(ctx, base);
+}
+
+// Huffman/inflate decoder (state r3). With null decode tables it makes no
+// progress and spins forever; bail out with 0 when the state or its tables are
+// clearly not valid pointers.
+extern "C" void __imp__sub_82656CA8(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_82656CA8) {
+    const uint32_t state = ctx.r3.u32;
+    bool valid = state >= 0x10000u;
+    if (valid) {
+        const uint32_t inner = GRd32(base, state + 28);
+        valid = inner >= 0x10000u && GRd32(base, inner + 68) >= 0x10000u &&
+                GRd32(base, inner + 72) >= 0x10000u;
+    }
+    if (!valid) {
+        ctx.r3.u64 = 0;
+        return;
+    }
+    __imp__sub_82656CA8(ctx, base);
+}
+
+// ----------------------------------------------------------------------------
+// Mid-function hooks (wired up by [[midasm_hook]] entries in the manifest)
+// ----------------------------------------------------------------------------
+
+// sub_82105FE8 @ 0x821061BC: per-voice virtual call. Slots whose voice failed
+// to be created are null; skip the dispatch (jumps to 0x821061D8) for those.
+bool SrSkipNullVoiceDispatch(PPCRegister& r28) {
+    return r28.u32 == 0;
+}
+
+// sub_8265F4F0 @ 0x8265F50C / 0x8265F554 / 0x8265F660: byte loads that bound
+// the following loops, whose 8-bit counters could otherwise never reach a
+// value above 255 left behind by a recovered fault. Keep them 8-bit.
+void SrClampByteR10(PPCRegister& r10) { r10.u64 &= 0xFFu; }
+void SrClampByteR7(PPCRegister& r7) { r7.u64 &= 0xFFu; }
+void SrClampByteR8(PPCRegister& r8) { r8.u64 &= 0xFFu; }
