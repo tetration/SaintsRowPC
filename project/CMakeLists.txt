@@ -61,3 +61,9 @@ endif()
 
 # /force:multiple lets stubs.cpp override the SDK's kernel export implementations.
 target_link_options(saintsrow PRIVATE "LINKER:/force:multiple" "LINKER:/STACK:16777216")
+
+# Put the SDK's DLLs next to the exe so it also runs from the build folder.
+add_custom_command(TARGET saintsrow POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:saintsrow> $<TARGET_FILE_DIR:saintsrow>
+    COMMAND_EXPAND_LISTS
+)
