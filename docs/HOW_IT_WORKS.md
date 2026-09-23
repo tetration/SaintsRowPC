@@ -43,6 +43,11 @@ that call the original where appropriate:
   state never reports completion.
 - **Kernel objects.** A few semaphore, event and thread-creation calls are
   adjusted for differences between the SDK and real hardware.
+- **Occlusion queries.** Lights, lens flares and similar effects are only
+  drawn when the game's visibility queries report them as visible. The
+  query-result function would skip the actual results while the device's
+  "direct" mode is on, which this port needs for tiled rendering; the override
+  reads the real results instead.
 - **Null-pointer paths.** Several string and lookup routines are regularly
   called with null pointers. On the console those reads are harmless; on PC each
   one would raise an exception. Guards return the same result without the
@@ -76,5 +81,10 @@ starts the game.
 - **Audio.** Audio client registration no longer holds a global lock while
   creating the audio driver (which could deadlock) and no longer hands out
   audio buffers before the client is fully registered.
+- **Occlusion queries** are measured on the GPU with Direct3D 12 queries. The
+  game uses separate memory blocks for the start and end of a query (one pair
+  per screen tile) and reads the results a frame or two later; results are
+  written back as soon as the GPU has finished the work, instead of reporting
+  every query as visible.
 - **Calls to unknown functions** return 0 instead of terminating the program.
 - **Input** is ignored while the window is not focused.

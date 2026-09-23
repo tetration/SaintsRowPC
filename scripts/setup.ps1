@@ -49,8 +49,13 @@ if ($Clean) {
 }
 $Stamps = Join-Path $Build "stamps"
 New-Item -ItemType Directory -Force -Path $Stamps | Out-Null
-function Done($name) { Test-Path (Join-Path $Stamps $name) }
-function MarkDone($name) { Set-Content -Path (Join-Path $Stamps $name) -Value (Get-Date -Format o) }
+# A step is redone when its inputs change (e.g. after pulling an update).
+function Done($name, $key) {
+    $f = Join-Path $Stamps $name
+    (Test-Path $f) -and ((Get-Content -Raw $f).Trim() -eq $key)
+}
+function MarkDone($name, $key) { Set-Content -Path (Join-Path $Stamps $name) -Value $key }
+function FileHash($path) { (Get-FileHash -Algorithm SHA1 $path).Hash }
 
 # ---------------------------------------------------------------------------
 # 1. Toolchain: Visual Studio 2022 (with its Clang, CMake and Ninja) + Git
@@ -126,7 +131,8 @@ if ($xexHash -ne $knownXex) {
 # ---------------------------------------------------------------------------
 # 3. ReXGlue SDK (runtime + recompiler), patched for Saints Row
 # ---------------------------------------------------------------------------
-if (-not (Done "sdk")) {
+$sdkKey = "$SdkCommit " + (FileHash (Join-Path $Root "patches\rexglue-sdk.patch"))
+if (-not (Done "sdk" $sdkKey)) {
     if (-not (Test-Path (Join-Path $SdkSrc ".git"))) {
         Step "Downloading the ReXGlue SDK"
         # autocrlf off so patches/rexglue-sdk.patch (LF) applies cleanly.
@@ -173,7 +179,7 @@ if (-not (Done "sdk")) {
     } finally {
         Pop-Location
     }
-    MarkDone "sdk"
+    MarkDone "sdk" $sdkKey
 } else {
     Write-Host "ReXGlue SDK already built - skipping."
 }
@@ -181,11 +187,12 @@ if (-not (Done "sdk")) {
 # ---------------------------------------------------------------------------
 # 4. Recompile the game executable (PowerPC -> C++)
 # ---------------------------------------------------------------------------
-if (-not (Done "codegen")) {
+$codegenKey = "$sdkKey " + (FileHash (Join-Path $Root "config\saintsrow_manifest.toml"))
+if (-not (Done "codegen" $codegenKey)) {
     Step "Recompiling default.xex (PowerPC -> C++)"
     $rexglue = Join-Path $SdkInstall "bin\rexglue.exe"
     Run $rexglue @("codegen", (Join-Path $Root "config\saintsrow_manifest.toml"), "--ignore-stamp")
-    MarkDone "codegen"
+    MarkDone "codegen" $codegenKey
 } else {
     Write-Host "Recompiled code already generated - skipping."
 }
@@ -201,8 +208,12 @@ Run "cmake" @("-S", (Join-Path $Root "project"), "-B", $GameBuild, "-G", "Ninja"
 Run "cmake" @("--build", $GameBuild)
 
 Step "Copying the game to dist"
-Copy-Item -Force (Join-Path $GameBuild "saintsrow.exe") $Dist
-Copy-Item -Force (Join-Path $SdkInstall "bin\*.dll") $Dist
+try {
+    Copy-Item -Force -ErrorAction Stop (Join-Path $GameBuild "saintsrow.exe") $Dist
+    Copy-Item -Force -ErrorAction Stop (Join-Path $SdkInstall "bin\*.dll") $Dist
+} catch {
+    Fail "Could not copy the game to dist ($($_.Exception.Message)). If Saints Row PC is running, close it and run setup again."
+}
 
 Stop-Transcript | Out-Null
 Write-Host "`nDone! Run dist\saintsrow.exe to play." -ForegroundColor Green

@@ -118,6 +118,58 @@ PPC_FUNC(sub_82185498) {
     __imp__sub_82185498(ctx, base);
 }
 
+// IDirect3DQuery::GetData. For occlusion queries (type 9) the original
+// returns "1 sample visible" without reading the results whenever the device's
+// "direct" bit is set, which ForceFrameFlags always does, so occluded lights
+// and flares were drawn through walls. This is the same code without that
+// shortcut: sum (end - begin) passed samples over the query's per-tile blocks,
+// or report "not ready" while the last block still holds D3D's marker.
+extern "C" void __imp__sub_825D4748(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_825D4748) {
+    const uint32_t query = ctx.r3.u32;
+    const uint32_t out = ctx.r4.u32;
+    if (!query || GRd32(base, query + 4) != 9) {
+        __imp__sub_825D4748(ctx, base);
+        return;
+    }
+    const uint32_t dev = GRd32(base, query + 0);
+    const uint32_t tiles = GRd32(base, query + 144);
+    if (tiles == 0) {
+        PPC_STORE_U32(out, 0);
+        ctx.r3.u64 = 0;  // S_OK
+        return;
+    }
+
+    constexpr uint32_t kNotFinished = 0xFFFFFEED;
+    const uint32_t last = GRd32(base, query + (tiles + 5) * 4);
+    if (GRd32(base, last + 0) == kNotFinished && GRd32(base, last + 8) == kNotFinished &&
+        GRd32(base, last + 16) == kNotFinished && GRd32(base, last + 24) == kNotFinished) {
+        // Still pending: kick the GPU if this query is in the current batch.
+        if (GRd32(base, query + 20) == GRd32(base, dev + 10780)) {
+            ctx.r3.u64 = dev;
+            sub_825D38C0(ctx, base);
+        }
+        PPC_STORE_U32(out, 1);
+        ctx.r3.u64 = 1;  // S_FALSE
+        return;
+    }
+
+    // Each tile has a 64-byte area: the end block, then the begin block. The GPU
+    // writes the counters little-endian.
+    auto le32 = [base](uint32_t addr) {
+        uint32_t v;
+        std::memcpy(&v, GuestPtr(base, addr), sizeof(v));
+        return v;
+    };
+    uint32_t sum = 0;
+    for (uint32_t i = 0; i < tiles; ++i) {
+        const uint32_t block = GRd32(base, query + 24 + i * 4);
+        sum += le32(block + 16) + le32(block + 20) - le32(block + 48) - le32(block + 52);
+    }
+    PPC_STORE_U32(out, sum);
+    ctx.r3.u64 = 0;  // S_OK
+}
+
 // Physics update: skipped (returns 0).
 PPC_FUNC(sub_8234C1C0) {
     ctx.r3.u64 = 0;
