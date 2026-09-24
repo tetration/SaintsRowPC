@@ -84,7 +84,7 @@ Options, set by creating a file next to `saintsrow.exe`:
 | `res_scale.txt` | Internal resolution scale: `1` (720p), `2` (default) or `3`. |
 | `start_windowed` | Start in a window instead of fullscreen. The file can be empty. |
 
-Press **F4** in game to open the display settings menu. It lists every
+Press **F5** in game to open the display settings menu. It lists every
 resolution your monitor supports and offers:
 
 | Setting | Effect |

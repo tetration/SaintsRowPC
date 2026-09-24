@@ -463,7 +463,7 @@ void DisplaySettingsDialog::OnDraw(ImGuiIO& io) {
 
     ImGui::Separator();
     ImGui::TextDisabled("Internal resolution replaces res_scale.txt.");
-    ImGui::TextDisabled("Press F4 to close this menu.");
+    ImGui::TextDisabled("Press F5 to close this menu.");
 
     ImGui::End();
 }

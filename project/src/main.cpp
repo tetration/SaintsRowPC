@@ -706,12 +706,12 @@ public:
             });
             window_->SetPresenter(gs->presenter());
 
-            // ImGui overlay stack: F4 opens the display settings menu.
+            // ImGui overlay stack: F5 opens the display settings menu.
             immediate_drawer_ = gs->provider()->CreateImmediateDrawer();
             immediate_drawer_->SetPresenter(gs->presenter());
             imgui_drawer_ = std::make_unique<rex::ui::ImGuiDrawer>(window_.get(), 64);
             imgui_drawer_->SetPresenterAndImmediateDrawer(gs->presenter(), immediate_drawer_.get());
-            rex::ui::RegisterBind("bind_display_menu", "F4", "Toggle display settings menu", [this]() {
+            rex::ui::RegisterBind("bind_display_menu", "F5", "Toggle display settings menu", [this]() {
                 if (display_dialog_) {
                     display_dialog_.reset();
                 } else {
