@@ -9,5 +9,5 @@ own disc image. It:
 3. runs `scripts\setup.ps1` with the chosen disc image;
 4. creates Start menu and desktop shortcuts.
 
-It contains no game code. Build it with `installer\build.ps1`. Pushing a tag
-such as `v1.0.0` builds it on GitHub and attaches it to a release.
+It contains no game code. Build it with `installer\build.ps1` and attach
+`installer\out\SaintsRowPC-Setup.exe` to a GitHub release.
