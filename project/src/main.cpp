@@ -5,6 +5,11 @@
 #include <cstring>
 #include "saintsrow_config.h"
 #include "saintsrow_init.h"
+#include "fps_overlay.h"
+#include "kbm.h"
+#include "perf_monitor.h"
+#include "profiler.h"
+#include "wml/mod_loader.h"
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
@@ -412,7 +417,8 @@ class SaintsRowApp : public rex::ui::WindowedApp,
                      public rex::ui::WindowListener,
                      public rex::ui::WindowInputListener {
 public:
-    // F11 toggles between fullscreen and windowed.
+    // F11 toggles between fullscreen and windowed, F1 shows the frame rate,
+    // F10 cycles the frame rate cap (30/60/90/120).
     void OnKeyDown(rex::ui::KeyEvent& e) override {
         if (rex::ui::ProcessKeyEvent(e)) {
             return;
@@ -421,6 +427,23 @@ public:
             window_->SetFullscreen(!window_->IsFullscreen());
             e.set_handled(true);
         }
+        if (e.virtual_key() == rex::ui::VirtualKey::kF1 && !e.prev_state()) {
+            fps_overlay_.Toggle();
+            e.set_handled(true);
+        }
+        if (e.virtual_key() == rex::ui::VirtualKey::kF10 && !e.prev_state()) {
+            fps_overlay_.ShowNotice(sr::CycleFpsCap());
+            e.set_handled(true);
+        }
+    }
+    // The cursor is hidden while the game has focus (the mouse moves the camera).
+    void OnGotFocus(rex::ui::UISetupEvent& e) override {
+        (void)e;
+        if (window_) window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
+    }
+    void OnLostFocus(rex::ui::UISetupEvent& e) override {
+        (void)e;
+        if (window_) window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
     }
     static std::unique_ptr<rex::ui::WindowedApp> Create(rex::ui::WindowedAppContext& ctx) {
         return std::make_unique<SaintsRowApp>(ctx);
@@ -466,11 +489,17 @@ public:
         if (REXCVAR_GET(log_verbose) && log_level_str == "info") {
             log_level_str = "trace";
         }
-        auto log_config = rex::BuildLogConfig("saintsrow_sdk.log", log_level_str, {});
+        // The GPU emulation warns about the same harmless things on every
+        // frame; logging (and flushing) them costs frame time.
+        auto log_config = rex::BuildLogConfig("saintsrow_sdk.log", log_level_str, {{"gpu", "error"}});
+        log_config.flush_level = spdlog::level::err;
         rex::InitLogging(log_config);
         rex::RegisterLogLevelCallback();
         REXLOG_INFO("Saints Row starting");
         REXLOG_INFO("  Game directory: {}", game_dir.string());
+        sr::StartPerfMonitor();
+        sr::LoadFpsCap();
+        sr::StartProfiler();
 
         runtime_ = std::make_unique<rex::Runtime>(game_dir);
         runtime_->set_app_context(&app_context());
@@ -485,6 +514,7 @@ public:
         window_->AddListener(this);
         window_->AddInputListener(this, 0);
         window_->Open();
+        window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
         // Window mode from config ("windowed", "borderless", "fullscreen"),
         // overridden by a "start_windowed" file next to the exe.
         {
@@ -525,6 +555,27 @@ public:
         config.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
         REXCVAR_SET(mnk_mode, true);
         {
+            // Keyboard and mouse are handled in kbm.cpp, so the SDK's own key
+            // bindings and mouse look are turned off. Mouse speed from
+            // "mouse_sensitivity.txt" next to the exe (1.0 = default).
+            rex::cvar::SetFlagByName("mnk_mouse", "false");
+            for (const char* bind : {"a", "b", "x", "y", "left_trigger", "right_trigger",
+                                     "left_shoulder", "right_shoulder", "lstick_up",
+                                     "lstick_down", "lstick_left", "lstick_right",
+                                     "lstick_press", "rstick_up", "rstick_down", "rstick_left",
+                                     "rstick_right", "rstick_press", "dpad_up", "dpad_down",
+                                     "dpad_left", "dpad_right", "back", "start", "guide"}) {
+                rex::cvar::SetFlagByName(std::string("keybind_") + bind, "");
+            }
+            double sensitivity = 1.0;
+            if (FILE* mf = std::fopen("mouse_sensitivity.txt", "rb")) {
+                double v = 0;
+                if (std::fscanf(mf, "%lf", &v) == 1 && v >= 0.05 && v <= 20.0) sensitivity = v;
+                std::fclose(mf);
+            }
+            sr::SetMouseSensitivity(sensitivity);
+        }
+        {
             // Internal resolution scale override: if "res_scale.txt" exists next
             // to the exe it wins over the config file (draw_resolution_scale_*).
             if (FILE* rf = std::fopen("res_scale.txt", "rb")) {
@@ -543,6 +594,35 @@ public:
                 // config file says otherwise (SDK default is 1x).
                 rex::cvar::SetFlagByName("draw_resolution_scale_x", "2");
                 rex::cvar::SetFlagByName("draw_resolution_scale_y", "2");
+            }
+            // The port hands the GPU every command buffer separately; ending a
+            // host GPU submission after each one costs far more than it saves.
+            // Submit once per frame instead.
+            rex::cvar::SetFlagByName("d3d12_submit_on_primary_buffer_end", "false");
+            // Streaming while driving: keep far more textures resident than the
+            // defaults (384/768 MB) instead of deleting and re-creating them,
+            // and allocate the GPU copy of guest memory up front rather than
+            // mapping it piece by piece (each mapping waits for the GPU).
+            rex::cvar::SetFlagByName("texture_cache_memory_limit_soft", "2048");
+            rex::cvar::SetFlagByName("texture_cache_memory_limit_hard", "4096");
+            rex::cvar::SetFlagByName("d3d12_tiled_shared_memory", "false");
+            // Let the game prepare the next command buffer while the GPU thread
+            // executes the previous one (queue depth 1). "gpu_queue.txt" next
+            // to the exe sets another depth; a file named "sync_gpu" turns it
+            // off (wait for every buffer, the old behaviour).
+            {
+                int depth = 1;
+                if (FILE* qf = std::fopen("gpu_queue.txt", "rb")) {
+                    int v = 0;
+                    if (std::fscanf(qf, "%d", &v) == 1 && v >= 0 && v <= 64) depth = v;
+                    std::fclose(qf);
+                }
+                if (FILE* sf = std::fopen("sync_gpu", "rb")) {
+                    std::fclose(sf);
+                    depth = 0;
+                }
+                rex::cvar::SetFlagByName("gpu_async_depth", std::to_string(depth));
+                REXLOG_INFO("GPU command queue depth: {}", depth);
             }
         }
         REXCVAR_SET(input_backend, "xinput");
@@ -566,8 +646,12 @@ public:
             input_sys->AttachWindow(window_.get());
             // Ignore controller/keyboard input while the game window is not focused.
             input_sys->SetActiveCallback([w = window_.get()] { return w->HasFocus(); });
-            REXLOG_INFO("Input attached: gamepads and keyboard enabled (Enter=Start, Space=A, Backspace=B, WASD=left stick)");
+            REXLOG_INFO("Input attached: controllers, keyboard and mouse");
         }
+
+        // Whompay's Mod Loader: file replacements must be in place before the
+        // game opens anything.
+        wml::Initialize(exe_dir, game_dir, runtime_->file_system(), "\\Device\\Harddisk0\\Partition1");
 
         status = runtime_->LoadXexImage("game:\\default.xex");
         if (XFAILED(status)) {
@@ -575,6 +659,27 @@ public:
             return false;
         }
         REXLOG_INFO("XEX image loaded");
+
+        // Render without the Xbox 360's 2x MSAA. With MSAA the frame doesn't
+        // fit the console's 10 MB of EDRAM, so the game draws everything twice
+        // (predicated tiling: one pass per screen tile), which doubles the
+        // graphics work here. The game's own "no_aa" tiling scenario draws the
+        // frame once; the PC build's higher internal resolution smooths edges
+        // instead. [0x827D7834] is the scenario index (r_set_tiling_scenario:
+        // 0 = no_aa, 1 = 2x_aa, the default). A file named "keep_msaa" next to
+        // the exe keeps the original.
+        {
+            FILE* km = std::fopen("keep_msaa", "rb");
+            if (km) {
+                std::fclose(km);
+                REXLOG_INFO("Tiling scenario: 2x_aa (keep_msaa)");
+            } else {
+                uint8_t* membase = runtime_->memory()->virtual_membase();
+                const uint32_t zero = 0;
+                std::memcpy(membase + 0x827D7834u, &zero, 4);
+                REXLOG_INFO("Tiling scenario: no_aa");
+            }
+        }
 
 #ifdef _WIN32
         // Commit the zero region before installing the handler, so near-null
@@ -584,11 +689,21 @@ public:
         g_main_thread_id = GetCurrentThreadId();
         AddVectoredExceptionHandler(1, NullPageHandler);
 #endif
+        // Code and script mods start once the executable is in memory.
+        wml::Start(runtime_->memory()->virtual_membase());
+
         spdlog::default_logger()->flush();
 
         // Connect the GPU presenter to the window.
         auto* gs = runtime_->graphics_system();
         if (gs && gs->presenter()) {
+            if (!fps_overlay_.Initialize(window_.get(), gs->provider(), gs->presenter())) {
+                REXLOG_WARN("Frame rate counter unavailable");
+            }
+            // Text from native mods is drawn by the same overlay.
+            wml::SetOverlayTextListener([this](bool shown) {
+                app_context().CallInUIThread([this, shown]() { fps_overlay_.SetModTextVisible(shown); });
+            });
             window_->SetPresenter(gs->presenter());
 
             // ImGui overlay stack: F4 opens the display settings menu.
@@ -647,6 +762,10 @@ public:
         rex::ui::UnregisterBind("bind_display_menu");
         imgui_drawer_.reset();
         immediate_drawer_.reset();
+        sr::StopPerfMonitor();
+        sr::StopProfiler();
+        wml::SetOverlayTextListener(nullptr);
+        fps_overlay_.Shutdown();
         if (window_) {
             window_->SetPresenter(nullptr);
         }
@@ -667,6 +786,7 @@ private:
     std::unique_ptr<rex::ui::ImGuiDrawer> imgui_drawer_;
     std::unique_ptr<DisplaySettingsDialog> display_dialog_;
     std::filesystem::path config_path_;
+    sr::FpsOverlay fps_overlay_;
     std::thread module_thread_;
     std::atomic<bool> shutting_down_{false};
 };

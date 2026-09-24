@@ -30,6 +30,7 @@ public:
     // config_path: where confirmed settings are written (saintsrow.toml).
     DisplaySettingsDialog(rex::ui::ImGuiDrawer* imgui_drawer, rex::ui::Window* window,
                           std::filesystem::path config_path);
+    ~DisplaySettingsDialog() override;
 
 protected:
     void OnDraw(ImGuiIO& io) override;

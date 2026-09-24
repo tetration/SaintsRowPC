@@ -46,6 +46,15 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
+## Mod loader dependencies
+
+Downloaded by CMake when the game is built (`build/game/_deps`):
+
+| Project | License |
+|---|---|
+| [Lua](https://www.lua.org) 5.4 | MIT |
+| [MinHook](https://github.com/TsudaKageyu/minhook) | BSD-2-Clause |
+
 ## ReXGlue SDK dependencies
 
 Fetched as submodules of the SDK into `build/rexglue-sdk/thirdparty`. Each

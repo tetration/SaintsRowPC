@@ -1,18 +1,45 @@
+diff --git a/include/rex/filesystem/vfs.h b/include/rex/filesystem/vfs.h
+index 96f86fe..9377c14 100644
+--- a/include/rex/filesystem/vfs.h
++++ b/include/rex/filesystem/vfs.h
+@@ -32,6 +32,11 @@ class VirtualFileSystem {
+   ~VirtualFileSystem();
+ 
+   bool RegisterDevice(std::unique_ptr<Device> device);
++  // Registers a device whose files take priority over those of the regular
++  // device with the same mount path (used for mods that replace game files).
++  // Only files are taken from overlays; directories always come from the
++  // regular device.
++  bool RegisterOverlayDevice(std::unique_ptr<Device> device);
+   bool UnregisterDevice(const std::string_view path);
+ 
+   bool RegisterSymbolicLink(const std::string_view path, const std::string_view target);
+@@ -51,6 +56,7 @@ class VirtualFileSystem {
+  private:
+   rex::thread::global_critical_region global_critical_region_;
+   std::vector<std::unique_ptr<Device>> devices_;
++  std::vector<std::unique_ptr<Device>> overlay_devices_;
+   std::unordered_map<std::string, std::string> symlinks_;
+ 
+   bool ResolveSymbolicLink(const std::string_view path, std::string& result);
 diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
-index da8e432..9658491 100644
+index da8e432..2562d4b 100644
 --- a/include/rex/graphics/command_processor.h
 +++ b/include/rex/graphics/command_processor.h
-@@ -94,6 +94,9 @@ class CommandProcessor {
+@@ -94,6 +94,12 @@ class CommandProcessor {
    virtual void Shutdown();
  
    void CallInThread(std::function<void()> fn);
-+  // Executes a linear big-endian PM4 stream on the command processor thread and
-+  // waits for it to finish. The data is copied, so the caller may reuse it.
++  // Queues a linear big-endian PM4 stream for the command processor thread
++  // (waiting for it to execute unless gpu_async_submit is off). The data is
++  // copied, so the caller may reuse it. With data == nullptr it waits instead:
++  // size 0 = until all submitted streams have executed, size 1 = frame
++  // boundary (until everything before the previous boundary has executed).
 +  bool SubmitCommandStream(const uint8_t* data, uint32_t size_bytes);
  
    virtual void ClearCaches();
    virtual void InvalidateGpuMemory();
-@@ -173,6 +176,13 @@ class CommandProcessor {
+@@ -173,6 +179,13 @@ class CommandProcessor {
    virtual void OnPrimaryBufferEnd() {}
    void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
    bool ExecutePacket(memory::RingBuffer* reader);
@@ -26,7 +53,7 @@ index da8e432..9658491 100644
    bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);
    bool ExecutePacketType1(memory::RingBuffer* reader, uint32_t packet);
    bool ExecutePacketType2(memory::RingBuffer* reader, uint32_t packet);
-@@ -239,6 +249,13 @@ class CommandProcessor {
+@@ -239,6 +252,13 @@ class CommandProcessor {
    system::object_ref<system::XHostThread> worker_thread_;
  
    std::queue<std::function<void()>> pending_fns_;
@@ -71,6 +98,18 @@ index 96d362b..be97856 100644
    struct VertexBufferState {
      uint32_t address = UINT32_MAX;
      uint32_t size = UINT32_MAX;
+diff --git a/include/rex/graphics/flags.h b/include/rex/graphics/flags.h
+index 2cf24c4..1e43481 100644
+--- a/include/rex/graphics/flags.h
++++ b/include/rex/graphics/flags.h
+@@ -15,6 +15,7 @@
+ 
+ // GPU Core
+ REXCVAR_DECLARE(bool, vsync);
++REXCVAR_DECLARE(double, guest_vblank_rate);
+ REXCVAR_DECLARE(bool, clear_memory_page_state);
+ REXCVAR_DECLARE(bool, half_pixel_offset);
+ REXCVAR_DECLARE(bool, async_shader_compilation);
 diff --git a/include/rex/graphics/graphics_system.h b/include/rex/graphics/graphics_system.h
 index ac6b056..2d1e2eb 100644
 --- a/include/rex/graphics/graphics_system.h
@@ -176,17 +215,98 @@ index 7a711a8..3bae941 100644
  
    if (out_index) {
      *out_index = index;
+diff --git a/src/filesystem/virtual_file_system.cpp b/src/filesystem/virtual_file_system.cpp
+index a1b4dad..c249c5b 100644
+--- a/src/filesystem/virtual_file_system.cpp
++++ b/src/filesystem/virtual_file_system.cpp
+@@ -37,6 +37,12 @@ bool VirtualFileSystem::RegisterDevice(std::unique_ptr<Device> device) {
+   return true;
+ }
+ 
++bool VirtualFileSystem::RegisterOverlayDevice(std::unique_ptr<Device> device) {
++  auto global_lock = global_critical_region_.Acquire();
++  overlay_devices_.emplace_back(std::move(device));
++  return true;
++}
++
+ bool VirtualFileSystem::UnregisterDevice(const std::string_view path) {
+   auto global_lock = global_critical_region_.Acquire();
+   for (auto it = devices_.begin(); it != devices_.end(); ++it) {
+@@ -115,6 +121,18 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
+     normalized_path = resolved_path;
+   }
+ 
++  // Files provided by overlay devices take priority, in registration order.
++  for (const auto& overlay : overlay_devices_) {
++    if (!rex::string::utf8_starts_with_case(normalized_path, overlay->mount_path())) {
++      continue;
++    }
++    auto* overlay_entry =
++        overlay->ResolvePath(normalized_path.substr(overlay->mount_path().size()));
++    if (overlay_entry && !(overlay_entry->attributes() & kFileAttributeDirectory)) {
++      return overlay_entry;
++    }
++  }
++
+   // Find the device.
+   auto it = std::find_if(devices_.cbegin(), devices_.cend(), [&](const auto& d) {
+     return rex::string::utf8_starts_with_case(normalized_path, d->mount_path());
+@@ -215,8 +233,29 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
+   Entry* parent_entry = nullptr;
+   Entry* entry = nullptr;
+ 
++  // Files provided by overlay devices take priority over the game's own. The
++  // lookup below goes through the parent directory, which always comes from
++  // the base device, so check the overlays first. Overlays are read-only and
++  // only used to open existing files.
++  if (!root_entry && !overlay_devices_.empty() &&
++      (creation_disposition == FileDisposition::kOpen ||
++       creation_disposition == FileDisposition::kOpenIf)) {
++    auto* resolved = ResolvePath(path);
++    if (resolved) {
++      auto global_lock = global_critical_region_.Acquire();
++      for (const auto& overlay : overlay_devices_) {
++        if (resolved->device() == overlay.get()) {
++          entry = resolved;
++          break;
++        }
++      }
++    }
++  }
++
+   auto base_path = rex::string::utf8_find_base_guest_path(path);
+-  if (!base_path.empty()) {
++  if (entry) {
++    // Found in an overlay.
++  } else if (!base_path.empty()) {
+     parent_entry = !root_entry ? ResolvePath(base_path) : root_entry->ResolvePath(base_path);
+     if (!parent_entry) {
+       *out_action = FileAction::kDoesNotExist;
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+index 0d8f8af..176bac7 100644
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -101,6 +101,8 @@ add_library(rex::gpu-xenos ALIAS rexgpu-xenos)
+ 
+ set_target_properties(rexgpu-xenos PROPERTIES
+     EXPORT_NAME gpu-xenos
++    # Named exports let a sampling profiler attribute time to functions.
++    WINDOWS_EXPORT_ALL_SYMBOLS TRUE
+     CXX_VISIBILITY_PRESET hidden
+     VISIBILITY_INLINES_HIDDEN ON
+ )
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index a744375..ffe9061 100644
+index a744375..a2f7de2 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
-@@ -10,10 +10,14 @@
+@@ -10,10 +10,15 @@
   */
  
  #include <algorithm>
 +#include <chrono>
  #include <cinttypes>
  #include <cmath>
++#include <condition_variable>
  #include <cstring>
 +#include <future>
 +#include <memory>
@@ -195,7 +315,21 @@ index a744375..ffe9061 100644
  
  #include <fmt/format.h>
  
-@@ -99,6 +103,13 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
+@@ -37,6 +42,13 @@
+ 
+ REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+ 
++REXCVAR_DEFINE_BOOL(gpu_async_submit, false, "GPU",
++                    "Return from SubmitCommandStream without waiting for the command "
++                    "processor to execute the stream");
++REXCVAR_DEFINE_INT32(gpu_async_depth, 0, "GPU",
++                     "Command streams SubmitCommandStream may leave queued ahead of the "
++                     "command processor (0 = wait for each stream to execute)");
++
+ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
+                     "Refresh page-valid state from GPU-written memory at frame end. "
+                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
+@@ -99,6 +111,13 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
    return ReadbackResolveMode::kDisabled;
  }
  
@@ -209,7 +343,7 @@ index a744375..ffe9061 100644
  }  // namespace
  
  CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
-@@ -158,15 +169,44 @@ void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cach
+@@ -158,15 +177,149 @@ void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cach
                                                 uint32_t title_id, bool blocking) {}
  
  void CommandProcessor::CallInThread(std::function<void()> fn) {
@@ -229,34 +363,139 @@ index a744375..ffe9061 100644
  
  void CommandProcessor::ClearCaches() {}
  
++namespace {
++// Submission bookkeeping for SubmitCommandStream (there is one command
++// processor).
++std::atomic<uint64_t> submit_seq{0};
++std::atomic<uint64_t> done_seq{0};
++std::mutex done_mutex;
++std::condition_variable done_cv;
++uint64_t frame_mark_seq = 0;
++
++// Statistics (logged every few seconds): submissions, time spent executing
++// them on the command processor thread, and time submitters spent waiting.
++std::atomic<uint64_t> stat_count{0};
++std::atomic<uint64_t> stat_bytes{0};
++std::atomic<uint64_t> stat_exec_us{0};
++std::atomic<uint64_t> stat_wait_us{0};
++std::atomic<int64_t> stat_last_log{0};
++std::atomic<uint64_t> stat_regwait_count{0};
++std::atomic<uint64_t> stat_regwait_us{0};
++
++uint64_t NowUs() {
++  return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                      std::chrono::steady_clock::now().time_since_epoch())
++                      .count());
++}
++
++void MaybeLogStats() {
++  const int64_t now = int64_t(NowUs());
++  int64_t last = stat_last_log.load();
++  if (now - last < 2000000 || !stat_last_log.compare_exchange_strong(last, now)) {
++    return;
++  }
++  const double seconds = last ? (now - last) / 1e6 : 2.0;
++  const uint64_t n = stat_count.exchange(0);
++  const uint64_t bytes = stat_bytes.exchange(0);
++  const uint64_t exec = stat_exec_us.exchange(0);
++  const uint64_t wait = stat_wait_us.exchange(0);
++  const uint64_t regwaits = stat_regwait_count.exchange(0);
++  const uint64_t regwait_us = stat_regwait_us.exchange(0);
++  REXLOG_INFO(
++      "SUBMIT {:.0f}/s, {:.0f} KB/s | exec {:.1f} ms/s ({:.0f} us each) | waited {:.1f} ms/s "
++      "({:.0f} us each) | WAIT_REG_MEM {:.0f}/s, {:.1f} ms/s",
++      n / seconds, bytes / 1024.0 / seconds, exec / 1000.0 / seconds, n ? double(exec) / n : 0.0,
++      wait / 1000.0 / seconds, n ? double(wait) / n : 0.0, regwaits / seconds,
++      regwait_us / 1000.0 / seconds);
++}
++
++void MarkDone(uint64_t seq) {
++  {
++    std::lock_guard<std::mutex> lock(done_mutex);
++    if (seq > done_seq.load(std::memory_order_relaxed)) {
++      done_seq.store(seq, std::memory_order_release);
++    }
++  }
++  done_cv.notify_all();
++}
++
++// Waits until every submission up to `seq` has executed (bounded, so a lost
++// device or shutdown can't hang the caller forever).
++bool WaitDone(uint64_t seq, const std::atomic<bool>& running) {
++  std::unique_lock<std::mutex> lock(done_mutex);
++  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++  while (done_seq.load(std::memory_order_acquire) < seq) {
++    if (!running.load() || std::chrono::steady_clock::now() > deadline) {
++      return false;
++    }
++    done_cv.wait_for(lock, std::chrono::milliseconds(50));
++  }
++  return true;
++}
++}  // namespace
++
 +bool CommandProcessor::SubmitCommandStream(const uint8_t* data, uint32_t size_bytes) {
-+  if (!data || !size_bytes || (size_bytes & 3) || !worker_running_) {
++  if (!worker_running_) {
++    return false;
++  }
++  if (!data) {
++    // Synchronization requests:
++    //   size 0: wait until everything submitted so far has executed.
++    //   size 1: frame boundary - wait until everything submitted before the
++    //           previous boundary has executed (keeps at most one frame of
++    //           work queued ahead of the command processor).
++    if (system::XThread::IsInThread(worker_thread_.get())) {
++      return true;
++    }
++    if (size_bytes == 0) {
++      return WaitDone(submit_seq.load(), worker_running_);
++    }
++    const uint64_t previous = frame_mark_seq;
++    frame_mark_seq = submit_seq.load();
++    return WaitDone(previous, worker_running_);
++  }
++  if (!size_bytes || (size_bytes & 3)) {
 +    return false;
 +  }
 +  // A spare dword distinguishes the full linear stream from an empty ring.
 +  auto bytes = std::make_shared<std::vector<uint8_t>>(size_bytes + 4);
 +  std::memcpy(bytes->data(), data, size_bytes);
-+  auto completion = std::make_shared<std::promise<bool>>();
-+  auto result = completion->get_future();
-+  CallInThread([this, bytes, completion, size_bytes]() {
++  const uint64_t seq = submit_seq.fetch_add(1) + 1;
++  const uint64_t submit_start = NowUs();
++  CallInThread([this, bytes, size_bytes, seq]() {
++    const uint64_t exec_start = NowUs();
 +    memory::RingBuffer reader(bytes->data(), bytes->size());
 +    reader.set_write_offset(size_bytes);
-+    const uint32_t resyncs = ExecutePacketsResync(&reader);
++    ExecutePacketsResync(&reader);
 +    OnPrimaryBufferEnd();
-+    completion->set_value(resyncs < kMaxPacketResyncsPerSpan);
++    stat_exec_us.fetch_add(NowUs() - exec_start, std::memory_order_relaxed);
++    MarkDone(seq);
 +  });
-+  // Bound the wait (e.g. during shutdown); the queued data outlives a timeout.
-+  if (result.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
++  stat_count.fetch_add(1, std::memory_order_relaxed);
++  stat_bytes.fetch_add(size_bytes, std::memory_order_relaxed);
++  if (REXCVAR_GET(gpu_async_submit)) {
++    MaybeLogStats();
++    return true;
++  }
++  // With a queue depth of N, return once everything up to N streams back has
++  // executed, so the submitting thread prepares the next stream while the
++  // command processor executes this one.
++  const int32_t depth = std::max(REXCVAR_GET(gpu_async_depth), 0);
++  const uint64_t need = seq > uint64_t(depth) ? seq - uint64_t(depth) : 0;
++  const bool ok = need == 0 || WaitDone(need, worker_running_);
++  stat_wait_us.fetch_add(NowUs() - submit_start, std::memory_order_relaxed);
++  MaybeLogStats();
++  if (!ok) {
 +    REXGPU_ERROR("Command stream submission timed out");
 +    return false;
 +  }
-+  return result.get();
++  return true;
 +}
 +
  void CommandProcessor::InvalidateGpuMemory() {}
  
  ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
-@@ -204,9 +244,16 @@ void CommandProcessor::WorkerThreadMain() {
+@@ -204,9 +357,16 @@ void CommandProcessor::WorkerThreadMain() {
    }
  
    while (worker_running_) {
@@ -276,7 +515,7 @@ index a744375..ffe9061 100644
        fn();
      }
  
-@@ -229,10 +276,10 @@ void CommandProcessor::WorkerThreadMain() {
+@@ -229,10 +389,10 @@ void CommandProcessor::WorkerThreadMain() {
          rex::thread::MaybeYield();
          loop_count++;
          write_ptr_index = write_ptr_index_.load();
@@ -289,7 +528,7 @@ index a744375..ffe9061 100644
          continue;
        }
      }
-@@ -341,6 +388,12 @@ uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
+@@ -341,6 +501,12 @@ uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
  }
  
  void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
@@ -302,7 +541,19 @@ index a744375..ffe9061 100644
    RegisterFile& regs = *register_file_;
    if (index >= RegisterFile::kRegisterCount) {
      auto [it, inserted] = extended_register_values_.insert_or_assign(index, value);
-@@ -619,14 +672,7 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+@@ -355,9 +521,8 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+ 
+   // Volatile for the WAIT_REG_MEM loop.
+   const_cast<volatile uint32_t&>(regs.values[index]) = value;
+-  if (!regs.GetRegisterInfo(index)) {
+-    REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
+-  }
++  // (No per-write lookup of the register's name: it is a large switch over
++  // function-local statics and this runs for every register write.)
+ 
+   // Scratch register writeback.
+   if (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) {
+@@ -619,14 +784,7 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
    memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
    reader.set_read_offset(read_index * sizeof(uint32_t));
    reader.set_write_offset(write_index * sizeof(uint32_t));
@@ -318,7 +569,7 @@ index a744375..ffe9061 100644
  
    OnPrimaryBufferEnd();
  
-@@ -636,30 +682,85 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+@@ -636,30 +794,85 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
  void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
    SCOPE_profile_cpu_f("gpu");
  
@@ -416,7 +667,20 @@ index a744375..ffe9061 100644
  }
  
  bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
-@@ -880,9 +981,10 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
+@@ -702,6 +915,12 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
+ 
+   uint32_t base_index = (packet & 0x7FFF);
+   uint32_t write_one_reg = (packet >> 15) & 0x1;
++  if (!write_one_reg) {
++    // Consecutive registers: written as a range, so shader constants and
++    // fetch constants take the bulk path instead of one virtual call each.
++    WriteRegisterRangeFromRing(reader, base_index, count);
++    return true;
++  }
+   for (uint32_t m = 0; m < count; m++) {
+     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
+     uint32_t target_index = write_one_reg ? base_index : base_index + m;
+@@ -880,9 +1099,10 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
      }
  
      default:
@@ -428,7 +692,7 @@ index a744375..ffe9061 100644
        break;
    }
  
-@@ -989,8 +1091,30 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -989,8 +1209,30 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
  
    bool is_memory = (wait_info & 0x10) != 0;
  
@@ -459,7 +723,35 @@ index a744375..ffe9061 100644
      uint32_t value = 0;
      if (is_memory) {
        value =
-@@ -1469,6 +1593,29 @@ bool CommandProcessor::ExecutePacketType3_SET_CONSTANT2(memory::RingBuffer* read
+@@ -1033,8 +1275,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+       // Wait.
+       if (wait >= 0x100) {
+         PrepareForWait();
+-        if (!REXCVAR_GET(vsync)) {
+-          // User wants it fast and dangerous.
++        // The awaited value is usually written within microseconds (the
++        // submitting guest thread is blocked until this buffer is done), and
++        // a sleep costs at least a millisecond, so spin briefly first.
++        if (!REXCVAR_GET(vsync) ||
++            std::chrono::steady_clock::now() - wait_start < std::chrono::milliseconds(2)) {
+           rex::thread::MaybeYield();
+         } else {
+           rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+@@ -1052,6 +1297,13 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+     }
+   } while (!matched);
+ 
++  const auto waited_total = std::chrono::steady_clock::now() - wait_start;
++  if (waited_total > std::chrono::microseconds(5)) {
++    stat_regwait_count.fetch_add(1, std::memory_order_relaxed);
++    stat_regwait_us.fetch_add(
++        uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(waited_total).count()),
++        std::memory_order_relaxed);
++  }
+   return true;
+ }
+ 
+@@ -1469,6 +1721,29 @@ bool CommandProcessor::ExecutePacketType3_SET_CONSTANT2(memory::RingBuffer* read
    return true;
  }
  
@@ -489,7 +781,7 @@ index a744375..ffe9061 100644
  bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer* reader,
                                                              uint32_t packet, uint32_t count) {
    // load constants from memory
-@@ -1479,7 +1626,7 @@ bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer*
+@@ -1479,7 +1754,7 @@ bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer*
    uint32_t size_dwords = reader->ReadAndSwap<uint32_t>();
    size_dwords &= 0xFFF;
    uint32_t type = (offset_type >> 16) & 0xFF;
@@ -498,7 +790,7 @@ index a744375..ffe9061 100644
    switch (type) {
      case 0:  // ALU
        WriteALURangeFromMem(index, xlat_address, size_dwords);
-@@ -1525,7 +1672,8 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
+@@ -1525,7 +1800,8 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
    assert_true(start == 0);
  
    auto shader =
@@ -746,10 +1038,32 @@ index 2be0e8e..8297caa 100644
    null_srv_desc.Texture2DArray.MostDetailedMip = 0;
    null_srv_desc.Texture2DArray.MipLevels = 1;
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index 8f2fcb0..e24d726 100644
+index 8f2fcb0..c12df68 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
-@@ -284,6 +284,10 @@ void GraphicsSystem::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
+@@ -31,6 +31,8 @@
+ #include <rex/ui/window.h>
+ #include <rex/ui/windowed_app_context.h>
+ 
++REXCVAR_DEFINE_DOUBLE(guest_vblank_rate, 0.0, "GPU",
++                      "Guest vertical blank rate in Hz while vsync is on (0 = video mode rate)");
+ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
+     .allowed({"none", "fxaa", "fxaa_extreme"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+@@ -162,6 +164,12 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+           uint64_t interval_ticks =
+               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
++          // A game can ask for vertical blanks faster than the video mode
++          // (for frame rates above it) without switching vsync off.
++          const double override_hz = REXCVAR_GET(guest_vblank_rate);
++          if (REXCVAR_GET(vsync) && override_hz >= 1.0) {
++            interval_ticks = std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / override_hz));
++          }
+           while (current_time - last_frame_time >= interval_ticks) {
+             MarkVblank();
+             last_frame_time += interval_ticks;
+@@ -284,6 +292,10 @@ void GraphicsSystem::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
    command_processor_->InitializeRingBuffer(ptr, size_log2);
  }
  
@@ -760,6 +1074,156 @@ index 8f2fcb0..e24d726 100644
  void GraphicsSystem::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) {
    command_processor_->EnableReadPointerWriteBack(ptr, block_size_log2);
  }
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 76f5600..4810d79 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -10,6 +10,8 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
++#include <chrono>
+ #include <cstdint>
+ #include <utility>
+ 
+@@ -253,6 +255,15 @@ void TextureCache::ClearCache() {
+   DestroyAllTextures();
+ }
+ 
++// Statistics logged by BeginFrame.
++namespace {
++std::atomic<uint64_t> stat_lookups{0};
++std::atomic<uint64_t> stat_created{0};
++std::atomic<uint64_t> stat_create_us{0};
++std::atomic<uint64_t> stat_destroyed{0};
++uint64_t stat_last_log_ms = 0;
++}  // namespace
++
+ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_index) {
+   // If memory usage is too high, destroy unused textures.
+   uint64_t current_time = rex::chrono::Clock::QueryHostUptimeMillis();
+@@ -297,6 +308,7 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
+     if (found_texture_it != textures_.end()) {
+       assert_true(found_texture_it->second.get() == texture);
+       textures_.erase(found_texture_it);
++      stat_destroyed.fetch_add(1, std::memory_order_relaxed);
+       // `texture` is invalid now.
+     }
+   }
+@@ -312,6 +324,19 @@ void TextureCache::BeginSubmission(uint64_t new_submission_index) {
+ }
+ 
+ void TextureCache::BeginFrame() {
++  {
++    const uint64_t now_ms = rex::chrono::Clock::QueryHostUptimeMillis();
++    if (now_ms - stat_last_log_ms >= 2000) {
++      const double seconds = stat_last_log_ms ? (now_ms - stat_last_log_ms) / 1000.0 : 2.0;
++      stat_last_log_ms = now_ms;
++      REXLOG_INFO(
++          "TEXTURES {} resident, {} MB | lookups {:.0f}/s | created {:.0f}/s ({:.1f} ms/s) | "
++          "destroyed {:.0f}/s",
++          textures_.size(), textures_total_host_memory_usage_ >> 20,
++          stat_lookups.exchange(0) / seconds, stat_created.exchange(0) / seconds,
++          stat_create_us.exchange(0) / 1000.0 / seconds, stat_destroyed.exchange(0) / seconds);
++    }
++  }
+   // In case there was a failure to create something in the previous frame, make
+   // sure bindings are reset so a new attempt will surely be made if the texture
+   // is requested again.
+@@ -762,6 +787,7 @@ void TextureCache::DestroyAllTextures(bool from_destructor) {
+ }
+ 
+ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
++  stat_lookups.fetch_add(1, std::memory_order_relaxed);
+   // Check if the texture is a scaled resolve texture.
+   if (IsDrawResolutionScaled() && key.tiled && IsScaledResolveSupportedForFormat(key)) {
+     texture_util::TextureGuestLayout scaled_resolve_guest_layout = key.GetGuestLayout();
+@@ -867,7 +893,14 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
+   // Create the texture and add it to the map.
+   Texture* texture;
+   {
++    const auto create_start = std::chrono::steady_clock::now();
+     std::unique_ptr<Texture> new_texture = CreateTexture(key);
++    stat_created.fetch_add(1, std::memory_order_relaxed);
++    stat_create_us.fetch_add(
++        uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                     std::chrono::steady_clock::now() - create_start)
++                     .count()),
++        std::memory_order_relaxed);
+     if (!new_texture) {
+       key.LogAction("Failed to create");
+       return nullptr;
+@@ -1035,7 +1068,9 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
+   uint32_t block_last = page_last >> 5;
+   uint32_t l2_block_first = block_first >> 6;
+   uint32_t l2_block_last = block_last >> 6;
+-  auto global_lock = global_critical_region_.Acquire();
++  // Read without the global critical region (the process-wide lock guest
++  // threads contend for): a concurrent change is equivalent to one made just
++  // before or after this check.
+   for (uint32_t i = l2_block_first; i <= l2_block_last; ++i) {
+     uint64_t l2_block = scaled_resolve_pages_l2_[i];
+     if (i == l2_block_first) {
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index ec0df7c..f4c5d19 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstring>
+ #include <utility>
+ 
+@@ -342,6 +343,46 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+     return true;
+   }
+ 
++  // Fast path: most requests are for data that is already up to date. Check
++  // the valid bits without taking the global critical region (the process-wide
++  // lock that guest threads contend for). A page being invalidated by a guest
++  // write at this very moment is no different from the write happening just
++  // after this check.
++  if (host_gpu_memory_sparse_granularity_log2_ == UINT32_MAX) {
++    bool all_valid = true;
++    const uint64_t* valid_bits = system_page_flags_valid_.data();
++    for (size_t i = 0; i < count && all_valid; ++i) {
++      uint32_t start = ranges[i].first;
++      uint32_t length = ranges[i].second;
++      if (!length) {
++        continue;
++      }
++      if (start > kBufferSize || (kBufferSize - start) < length) {
++        return false;
++      }
++      uint32_t page_first = start >> page_size_log2_;
++      uint32_t page_last = (start + length - 1) >> page_size_log2_;
++      for (uint32_t block = page_first >> 6; block <= (page_last >> 6); ++block) {
++        uint64_t needed = UINT64_MAX;
++        if (block == (page_first >> 6)) {
++          needed &= ~((uint64_t(1) << (page_first & 63)) - 1);
++        }
++        if (block == (page_last >> 6) && (page_last & 63) != 63) {
++          needed &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
++        }
++        uint64_t bits = reinterpret_cast<const std::atomic<uint64_t>*>(valid_bits + block)
++                            ->load(std::memory_order_acquire);
++        if ((bits & needed) != needed) {
++          all_valid = false;
++          break;
++        }
++      }
++    }
++    if (all_valid) {
++      return true;
++    }
++  }
++
+   // Some texture or buffer is empty, for example - safe to draw in this case.
+   std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
+   merged_ranges.reserve(count);
 diff --git a/src/graphics/util/draw.cpp b/src/graphics/util/draw.cpp
 index 305380e..06ffab5 100644
 --- a/src/graphics/util/draw.cpp

@@ -145,7 +145,13 @@ DisplaySettingsDialog::DisplaySettingsDialog(rex::ui::ImGuiDrawer* imgui_drawer,
     if (HWND hwnd = static_cast<HWND>(window_->GetNativeWindowHandle())) {
         device_name_ = DeviceNameForWindow(hwnd);
     }
+    // The game hides the cursor; show it while the menu is open.
+    window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
     EnumerateModes();
+}
+
+DisplaySettingsDialog::~DisplaySettingsDialog() {
+    window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
 }
 
 void DisplaySettingsDialog::EnumerateModes() {

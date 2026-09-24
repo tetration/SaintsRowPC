@@ -26,7 +26,19 @@ resolution by default.
 - Only the disc version this port was made with is supported. Setup warns if
   your `default.xex` is different.
 
-## Requirements
+## Easy install
+
+Download **SaintsRowPC-Setup.exe** from the
+[latest release](https://github.com/whompay/SaintsRowPC/releases/latest), run
+it, select your `.iso` and press **Install**. Setup downloads and installs
+anything missing (Git, the Visual Studio C++ build tools, the Visual C++
+runtime), builds the game and adds a Saints Row PC shortcut.
+
+Already built the game? Run **SaintsRowPC-Updater.exe** from the same release
+and choose your Saints Row PC folder to get the latest patches and the mod
+loader. Only what changed is rebuilt.
+
+## Requirements (manual build)
 
 - Your own Saints Row (Xbox 360) disc, dumped to an `.iso` file.
 - Windows 10 or 11 (64-bit) and a GPU with Direct3D 12 support.
@@ -39,7 +51,7 @@ resolution by default.
 - About 15 GB of free disk space and 16 GB of RAM. The first build takes
   30–90 minutes depending on your CPU.
 
-## Building
+## Building manually
 
 1. Download this repository to a short path, for example `C:\SaintsRowPC`.
 2. Run `setup.bat`.
@@ -52,7 +64,8 @@ troubleshooting.
 
 ## Playing
 
-Run `dist\saintsrow.exe`.
+Run `dist\WhompaysModLoader.exe` to pick mods and play, or `dist\saintsrow.exe`
+to play directly.
 
 | Action | Control |
 |---|---|
@@ -86,6 +99,14 @@ resolution your monitor supports and offers:
 otherwise it reverts. Settings are saved to `saintsrow.toml` next to
 the exe. F11 toggles fullscreen.
 
+## Mods
+
+Saints Row PC comes with **Whompay's Mod Loader**. Run
+`dist\WhompaysModLoader.exe` to turn mods on or off and change their load
+order, then press Play. Mods can replace game files, run Lua scripts, or load
+C/C++ code that hooks the game's functions. See
+[modding/README.md](modding/README.md) to use or make mods.
+
 ## How it works
 
 The ReXGlue SDK translates every PowerPC function in the game's executable to
@@ -97,6 +118,8 @@ input. This repository adds the Saints Row-specific parts:
 | `config/saintsrow_manifest.toml` | Recompiler configuration: ABI helpers, functions static analysis misses, mid-function hooks |
 | `project/src/stubs.cpp` | Game-specific replacements for recompiled functions and kernel calls |
 | `project/src/main.cpp` | Program entry: memory setup, window, runtime |
+| `project/src/wml`, `project/launcher` | Whompay's Mod Loader and its launcher |
+| `modding` | Mod API header, examples and documentation |
 | `patches/rexglue-sdk.patch` | Changes to the SDK that the game needs |
 | `tools/xiso_extract` | Xbox disc image (XDVDFS) extractor |
 | `scripts/setup.ps1` | The build script behind `setup.bat` |
