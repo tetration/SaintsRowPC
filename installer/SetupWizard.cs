@@ -50,12 +50,17 @@ namespace SaintsRowPCSetup
     static class Program
     {
         [STAThread]
-        static void Main()
+        static void Main(string[] args)
         {
             try { ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; } catch { } // TLS 1.2
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new SetupForm());
+            bool update = false;
+#if UPDATER
+            update = true;
+#endif
+            foreach (var a in args) if (a.Equals("/update", StringComparison.OrdinalIgnoreCase)) update = true;
+            Application.Run(new SetupForm(update));
         }
     }
 
@@ -66,7 +71,8 @@ namespace SaintsRowPCSetup
         TextBox isoBox, dirBox, logBox;
         Button isoBrowse, dirBrowse, installBtn, cancelBtn, playBtn;
         CheckBox desktopShortcut;
-        Label statusLabel;
+        RadioButton installMode, updateMode;
+        Label statusLabel, isoLabel, dirLabel;
         ProgressBar progress;
         Thread worker;
         volatile bool cancelled;
@@ -75,11 +81,11 @@ namespace SaintsRowPCSetup
         readonly object logLock = new object();
         string gitDir;
 
-        public SetupForm()
+        public SetupForm(bool update)
         {
             Text = "Saints Row PC Setup " + Config.Version;
             AutoScaleMode = AutoScaleMode.Dpi;
-            ClientSize = new Size(720, 540);
+            ClientSize = new Size(720, 568);
             MinimumSize = new Size(620, 460);
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Segoe UI", 9F);
@@ -97,32 +103,34 @@ namespace SaintsRowPCSetup
                 Location = new Point(18, 48), Size = new Size(684, 48),
                 Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
             };
+            installMode = new RadioButton { Text = "New install", AutoSize = true, Location = new Point(18, 100), Checked = !update };
+            updateMode = new RadioButton { Text = "Update an existing install (new patches and the mod loader)", AutoSize = true, Location = new Point(130, 100), Checked = update };
 
-            var isoLabel = new Label { Text = "Saints Row disc image (.iso):", AutoSize = true, Location = new Point(18, 104) };
-            isoBox = new TextBox { Location = new Point(18, 124), Width = 580, Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
-            isoBrowse = new Button { Text = "Browse...", Location = new Point(606, 122), Width = 96, Anchor = AnchorStyles.Top | AnchorStyles.Right };
+            isoLabel = new Label { Text = "Saints Row disc image (.iso):", AutoSize = true, Location = new Point(18, 132) };
+            isoBox = new TextBox { Location = new Point(18, 152), Width = 580, Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
+            isoBrowse = new Button { Text = "Browse...", Location = new Point(606, 150), Width = 96, Anchor = AnchorStyles.Top | AnchorStyles.Right };
             isoBrowse.Click += delegate {
                 using (var d = new OpenFileDialog { Filter = "Disc image (*.iso)|*.iso|All files (*.*)|*.*", Title = "Select your Saints Row disc image" })
                     if (d.ShowDialog(this) == DialogResult.OK) isoBox.Text = d.FileName;
             };
 
-            var dirLabel = new Label { Text = "Install folder (a short path without spaces works best):", AutoSize = true, Location = new Point(18, 156) };
-            dirBox = new TextBox { Location = new Point(18, 176), Width = 580, Text = DefaultInstallDir(), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
-            dirBrowse = new Button { Text = "Browse...", Location = new Point(606, 174), Width = 96, Anchor = AnchorStyles.Top | AnchorStyles.Right };
+            dirLabel = new Label { Text = "Install folder (a short path without spaces works best):", AutoSize = true, Location = new Point(18, 184) };
+            dirBox = new TextBox { Location = new Point(18, 204), Width = 580, Text = DefaultInstallDir(), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
+            dirBrowse = new Button { Text = "Browse...", Location = new Point(606, 202), Width = 96, Anchor = AnchorStyles.Top | AnchorStyles.Right };
             dirBrowse.Click += delegate {
-                using (var d = new FolderBrowserDialog { Description = "Choose where Saints Row PC is installed", ShowNewFolderButton = true })
-                    if (d.ShowDialog(this) == DialogResult.OK) dirBox.Text = Path.Combine(d.SelectedPath, "SaintsRowPC");
+                using (var d = new FolderBrowserDialog { Description = "Choose the Saints Row PC folder", ShowNewFolderButton = true })
+                    if (d.ShowDialog(this) == DialogResult.OK) dirBox.Text = Updating || IsInstallFolder(d.SelectedPath) ? d.SelectedPath : Path.Combine(d.SelectedPath, "SaintsRowPC");
             };
 
-            desktopShortcut = new CheckBox { Text = "Create a desktop shortcut", Checked = true, AutoSize = true, Location = new Point(18, 208) };
+            desktopShortcut = new CheckBox { Text = "Create a desktop shortcut", Checked = true, AutoSize = true, Location = new Point(18, 236) };
 
-            statusLabel = new Label { Text = "Ready.", Location = new Point(18, 238), Size = new Size(684, 20), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
-            progress = new ProgressBar { Location = new Point(18, 260), Size = new Size(684, 18), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
+            statusLabel = new Label { Text = "Ready.", Location = new Point(18, 266), Size = new Size(684, 20), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
+            progress = new ProgressBar { Location = new Point(18, 288), Size = new Size(684, 18), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
 
             logBox = new TextBox {
                 Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, WordWrap = false,
                 Font = new Font("Consolas", 8.5F), BackColor = Color.FromArgb(24, 24, 24), ForeColor = Color.Gainsboro,
-                Location = new Point(18, 286), Size = new Size(684, 206),
+                Location = new Point(18, 314), Size = new Size(684, 206),
                 Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
             };
 
@@ -137,8 +145,64 @@ namespace SaintsRowPCSetup
             playBtn.Click += delegate { LaunchGame(); };
             AcceptButton = installBtn;
 
-            Controls.AddRange(new Control[] { title, intro, isoLabel, isoBox, isoBrowse, dirLabel, dirBox, dirBrowse,
+            installMode.CheckedChanged += delegate { ApplyMode(); };
+            updateMode.CheckedChanged += delegate { ApplyMode(); };
+            Controls.AddRange(new Control[] { title, intro, installMode, updateMode, isoLabel, isoBox, isoBrowse, dirLabel, dirBox, dirBrowse,
                 desktopShortcut, statusLabel, progress, logBox, installBtn, cancelBtn, playBtn, link });
+        }
+
+        bool Updating { get { return updateMode.Checked; } }
+
+        void ApplyMode()
+        {
+            if (Updating)
+            {
+                Text = "Saints Row PC Updater " + Config.Version;
+                isoLabel.Text = "Saints Row disc image (.iso) - only needed if the game files are missing:";
+                dirLabel.Text = "Your Saints Row PC folder (the one with setup.bat and the dist folder):";
+                installBtn.Text = "Update";
+                string known = KnownInstallDir();
+                if (known != null) dirBox.Text = known;
+            }
+            else
+            {
+                Text = "Saints Row PC Setup " + Config.Version;
+                isoLabel.Text = "Saints Row disc image (.iso):";
+                dirLabel.Text = "Install folder (a short path without spaces works best):";
+                installBtn.Text = "Install";
+            }
+        }
+
+        protected override void OnShown(EventArgs e) { base.OnShown(e); ApplyMode(); }
+
+        // The folder of an earlier install: remembered by Setup, or the folder Setup runs from.
+        static string KnownInstallDir()
+        {
+            try
+            {
+                using (var k = Registry.CurrentUser.OpenSubKey(@"Software\SaintsRowPC"))
+                {
+                    string d = k == null ? null : k.GetValue("InstallDir") as string;
+                    if (d != null && IsInstallFolder(d)) return d;
+                }
+            }
+            catch { }
+            string here = Path.GetDirectoryName(Application.ExecutablePath);
+            if (IsInstallFolder(here)) return here;
+            string parent = Path.GetDirectoryName(here);
+            if (parent != null && IsInstallFolder(parent)) return parent;
+            return null;
+        }
+
+        static bool IsInstallFolder(string d)
+        {
+            try { return File.Exists(Path.Combine(d, @"scripts\setup.ps1")) || File.Exists(Path.Combine(d, "setup.bat")); }
+            catch { return false; }
+        }
+
+        static void RememberInstallDir(string dir)
+        {
+            try { using (var k = Registry.CurrentUser.CreateSubKey(@"Software\SaintsRowPC")) k.SetValue("InstallDir", dir); } catch { }
         }
 
         static string DefaultInstallDir()
@@ -196,7 +260,25 @@ namespace SaintsRowPCSetup
         void StartInstall()
         {
             string iso = isoBox.Text.Trim().Trim('"');
-            string dir = dirBox.Text.Trim().Trim('"');
+            string dir = dirBox.Text.Trim().Trim('"').TrimEnd('\\');
+            if (Updating)
+            {
+                // Accept the dist or scripts folder too.
+                string name = Path.GetFileName(dir), parent = Path.GetDirectoryName(dir);
+                if (!IsInstallFolder(dir) && parent != null && IsInstallFolder(parent) &&
+                    (name.Equals("dist", StringComparison.OrdinalIgnoreCase) || name.Equals("scripts", StringComparison.OrdinalIgnoreCase)))
+                { dir = parent; dirBox.Text = dir; }
+                if (!IsInstallFolder(dir))
+                { MessageBox.Show(this, "That folder is not a Saints Row PC folder. Choose the folder that contains setup.bat and the dist folder.", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+            }
+            else if (IsInstallFolder(dir))
+            {
+                if (MessageBox.Show(this, "Saints Row PC is already in that folder. Update it instead?", Text,
+                        MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+                updateMode.Checked = true;
+            }
+            if (Process.GetProcessesByName("saintsrow").Length > 0 || Process.GetProcessesByName("WhompaysModLoader").Length > 0)
+            { MessageBox.Show(this, "Close Saints Row PC and the mod loader first.", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
             bool gameExtracted = File.Exists(Path.Combine(dir, @"dist\game\default.xex"));
             if (!gameExtracted && (iso.Length == 0 || !File.Exists(iso)))
             { MessageBox.Show(this, "Select your Saints Row disc image (.iso) first.", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
@@ -205,7 +287,7 @@ namespace SaintsRowPCSetup
             if (dir.Length > 60 &&
                 MessageBox.Show(this, "The install folder path is long, which can make the build fail. Continue anyway?", Text,
                     MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
-            if (Directory.Exists(dir) && !Directory.Exists(Path.Combine(dir, ".git")) && HasOtherFiles(dir))
+            if (!Updating && Directory.Exists(dir) && !IsInstallFolder(dir) && HasOtherFiles(dir))
             { MessageBox.Show(this, "The install folder already contains other files. Choose an empty or new folder.", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
 
             try
@@ -227,8 +309,11 @@ namespace SaintsRowPCSetup
             worker.Start();
         }
 
+        bool IsUpdate;
+
         void Run(string iso, string dir, bool shortcut)
         {
+            IsUpdate = IsInstallFolder(dir);
             try
             {
                 Directory.CreateDirectory(dir);
@@ -240,16 +325,34 @@ namespace SaintsRowPCSetup
                 string vs = EnsureBuildTools();
                 Log("Visual Studio: " + vs);
                 EnsureVcRuntime();
-                GetSource(dir);
+                bool changed = GetSource(dir);
+                if (!changed && File.Exists(Path.Combine(dir, @"dist\saintsrow.exe")) && File.Exists(Path.Combine(dir, @"dist\WhompaysModLoader.exe")))
+                {
+                    DialogResult r = DialogResult.No;
+                    Invoke((Action)delegate {
+                        r = MessageBox.Show(this, "Saints Row PC is already up to date. Rebuild it anyway?", Text,
+                            MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                    });
+                    if (r != DialogResult.Yes)
+                    {
+                        CreateShortcuts(dir, shortcut);
+                        RememberInstallDir(dir);
+                        Progress(100);
+                        Status("Already up to date.");
+                        Ui(delegate { playBtn.Visible = true; });
+                        return;
+                    }
+                }
                 BuildGame(dir, iso);
                 CreateShortcuts(dir, shortcut);
+                RememberInstallDir(dir);
 
                 Progress(100);
-                Status("Done! Saints Row PC is installed.");
+                Status(changed && IsUpdate ? "Done! Saints Row PC is updated." : "Done! Saints Row PC is installed.");
                 Log("Run " + Path.Combine(dir, @"dist\WhompaysModLoader.exe") + " to choose mods and play.");
                 Ui(delegate {
                     playBtn.Visible = true;
-                    MessageBox.Show(this, "Saints Row PC is installed. Press Play, or use the Saints Row PC shortcut.", Text,
+                    MessageBox.Show(this, "Saints Row PC is ready. Press Play, or use the Saints Row PC shortcut.", Text,
                         MessageBoxButtons.OK, MessageBoxIcon.Information);
                 });
             }
@@ -420,31 +523,50 @@ namespace SaintsRowPCSetup
 
         // ------------------------------------------------------------------ Source code
 
-        void GetSource(string dir)
+        // Returns true when the source code changed (new install or new patches).
+        bool GetSource(string dir)
         {
             string git = Path.Combine(gitDir, "git.exe");
-            if (Directory.Exists(Path.Combine(dir, ".git")))
+            if (IsInstallFolder(dir))
             {
-                Status("Updating the Saints Row PC source code");
+                // Existing install: a git clone, or a zip download from GitHub. Bring it to the
+                // latest version; the build folder and dist (game files, mod settings) are kept.
+                Status("Downloading the latest Saints Row PC patches");
                 Progress(-1);
-                int c = RunLogged(git, "-C \"" + dir + "\" pull --ff-only", dir, null);
-                if (c != 0) Log("Could not update the source code (exit code " + c + "); using the copy already downloaded.");
-                return;
+                bool isRepo = Directory.Exists(Path.Combine(dir, ".git"));
+                string before = isRepo ? (RunCapture(git, "-C \"" + dir + "\" rev-parse HEAD") ?? "").Trim() : "";
+                if (!isRepo && RunLogged(git, "init -q \"" + dir + "\"", dir, null) != 0)
+                    throw new StepFailed("Could not prepare the folder for updates (git init failed).");
+                int code = RunLogged(git, "-C \"" + dir + "\" fetch --depth 1 " + Config.RepoUrl + " " + Config.Branch, dir, null);
+                CheckCancel();
+                if (code != 0) throw new StepFailed("Downloading the update failed (git exit code " + code + "). Check your internet connection.");
+                RunLogged(git, "-C \"" + dir + "\" config core.autocrlf false", dir, null);
+                string after = (RunCapture(git, "-C \"" + dir + "\" rev-parse FETCH_HEAD") ?? "").Trim();
+                if (isRepo && after.Length > 0 && after == before) { Log("Source code is already the latest version (" + Short(after) + ")."); return false; }
+                code = RunLogged(git, "-C \"" + dir + "\" checkout -f -B " + Config.Branch + " FETCH_HEAD", dir, null);
+                if (code != 0) throw new StepFailed("Applying the update failed (git exit code " + code + ").");
+                RunLogged(git, "-C \"" + dir + "\" remote remove origin", dir, null);
+                RunLogged(git, "-C \"" + dir + "\" remote add origin " + Config.RepoUrl, dir, null);
+                Log("Updated " + (before.Length > 0 ? Short(before) : "download") + " -> " + Short(after));
+                return true;
             }
             Status("Downloading the Saints Row PC source code");
             Progress(-1);
             string tmp = Path.Combine(dir, ".download");
             if (Directory.Exists(tmp)) ForceDelete(tmp);
-            int code = RunLogged(git, "clone --depth 1 --branch " + Config.Branch + " --progress " + Config.RepoUrl + " \"" + tmp + "\"", dir, null);
+            int c = RunLogged(git, "clone -c core.autocrlf=false --depth 1 --branch " + Config.Branch + " --progress " + Config.RepoUrl + " \"" + tmp + "\"", dir, null);
             CheckCancel();
-            if (code != 0) throw new StepFailed("Downloading the source code failed (git exit code " + code + "). Check your internet connection.");
+            if (c != 0) throw new StepFailed("Downloading the source code failed (git exit code " + c + "). Check your internet connection.");
             foreach (var entry in Directory.GetFileSystemEntries(tmp))
             {
                 string target = Path.Combine(dir, Path.GetFileName(entry));
                 if (Directory.Exists(entry)) Directory.Move(entry, target); else File.Move(entry, target);
             }
             ForceDelete(tmp);
+            return true;
         }
+
+        static string Short(string sha) { return sha.Length > 7 ? sha.Substring(0, 7) : sha; }
 
         // ------------------------------------------------------------------ Build
 
@@ -492,20 +614,21 @@ namespace SaintsRowPCSetup
                 MakeShortcut(Path.Combine(menu, "Saints Row PC (no mod menu).lnk"), Path.Combine(dist, "saintsrow.exe"), dist, "Play Saints Row PC without the mod loader");
                 string setupCopy = Path.Combine(dir, "SaintsRowPC-Setup.exe");
                 try { if (!string.Equals(Application.ExecutablePath, setupCopy, StringComparison.OrdinalIgnoreCase)) File.Copy(Application.ExecutablePath, setupCopy, true); } catch { }
-                if (File.Exists(setupCopy)) MakeShortcut(Path.Combine(menu, "Update or repair Saints Row PC.lnk"), setupCopy, dir, "Update or rebuild Saints Row PC");
+                if (File.Exists(setupCopy)) MakeShortcut(Path.Combine(menu, "Update Saints Row PC.lnk"), setupCopy, dir, "Get the latest Saints Row PC patches and mods", "/update");
                 if (desktop)
                     MakeShortcut(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "Saints Row PC.lnk"), target, dist, "Play Saints Row PC");
             }
             catch (Exception ex) { Log("Could not create shortcuts: " + ex.Message); }
         }
 
-        static void MakeShortcut(string lnk, string target, string workDir, string description)
+        static void MakeShortcut(string lnk, string target, string workDir, string description, string arguments = "")
         {
             Type t = Type.GetTypeFromProgID("WScript.Shell");
             object shell = Activator.CreateInstance(t);
             object sc = t.InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, shell, new object[] { lnk });
             Type st = sc.GetType();
             st.InvokeMember("TargetPath", BindingFlags.SetProperty, null, sc, new object[] { target });
+            if (arguments.Length > 0) st.InvokeMember("Arguments", BindingFlags.SetProperty, null, sc, new object[] { arguments });
             st.InvokeMember("WorkingDirectory", BindingFlags.SetProperty, null, sc, new object[] { workDir });
             st.InvokeMember("Description", BindingFlags.SetProperty, null, sc, new object[] { description });
             st.InvokeMember("IconLocation", BindingFlags.SetProperty, null, sc, new object[] { target + ",0" });

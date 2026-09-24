@@ -34,6 +34,10 @@ it, select your `.iso` and press **Install**. Setup downloads and installs
 anything missing (Git, the Visual Studio C++ build tools, the Visual C++
 runtime), builds the game and adds a Saints Row PC shortcut.
 
+Already built the game? Run **SaintsRowPC-Updater.exe** from the same release
+and choose your Saints Row PC folder to get the latest patches and the mod
+loader. Only what changed is rebuilt.
+
 ## Requirements (manual build)
 
 - Your own Saints Row (Xbox 360) disc, dumped to an `.iso` file.
