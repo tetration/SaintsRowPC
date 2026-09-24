@@ -26,7 +26,15 @@ resolution by default.
 - Only the disc version this port was made with is supported. Setup warns if
   your `default.xex` is different.
 
-## Requirements
+## Easy install
+
+Download **SaintsRowPC-Setup.exe** from the
+[latest release](https://github.com/whompay/SaintsRowPC/releases/latest), run
+it, select your `.iso` and press **Install**. Setup downloads and installs
+anything missing (Git, the Visual Studio C++ build tools, the Visual C++
+runtime), builds the game and adds a Saints Row PC shortcut.
+
+## Requirements (manual build)
 
 - Your own Saints Row (Xbox 360) disc, dumped to an `.iso` file.
 - Windows 10 or 11 (64-bit) and a GPU with Direct3D 12 support.
@@ -39,7 +47,7 @@ resolution by default.
 - About 15 GB of free disk space and 16 GB of RAM. The first build takes
   30–90 minutes depending on your CPU.
 
-## Building
+## Building manually
 
 1. Download this repository to a short path, for example `C:\SaintsRowPC`.
 2. Run `setup.bat`.
