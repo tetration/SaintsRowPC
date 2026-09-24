@@ -20,6 +20,7 @@ endif()
 set(SAINTSROW_SOURCES
     src/main.cpp
     src/stubs.cpp
+    src/display_menu.cpp
     ${REXGLUE_SHARE_DIR}/rex_app.cpp
 )
 if(EXISTS "${REXGLUE_SHARE_DIR}/windowed_app_main_sdl.cpp")

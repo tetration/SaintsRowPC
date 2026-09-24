@@ -71,6 +71,21 @@ Options, set by creating a file next to `saintsrow.exe`:
 | `res_scale.txt` | Internal resolution scale: `1` (720p), `2` (default) or `3`. |
 | `start_windowed` | Start in a window instead of fullscreen. The file can be empty. |
 
+Press **F4** in game to open the display settings menu. It lists every
+resolution your monitor supports and offers:
+
+| Setting | Effect |
+|---|---|
+| Window mode | `Windowed`, `Borderless Fullscreen` (desktop resolution) or `Fullscreen` (changes the monitor's display mode). |
+| Resolution | Window size in windowed mode, display mode in fullscreen. |
+| Widescreen | `Keep aspect (black bars)`, `Fill screen (crop edges)` (zooms in, crops top/bottom, no distortion) or `Stretch to fill (distorts)`. Applies immediately. |
+| Aspect ratio | `Auto (game)`, `4:3`, `16:9`, `16:10` or `21:9` — the shape the image is presented at. Combined with `Keep aspect` you get bars around the chosen ratio; with `Fill screen` it zooms to cover. Has no effect in `Stretch` mode. |
+| Internal resolution | Render scale `1x` (720p) to `4x` (2880p). Applies after a restart. `res_scale.txt` overrides it if present. |
+
+**Apply** switches immediately and asks you to confirm within 30 seconds,
+otherwise it reverts. Settings are saved to `saintsrow.toml` next to
+the exe. F11 toggles fullscreen.
+
 ## How it works
 
 The ReXGlue SDK translates every PowerPC function in the game's executable to

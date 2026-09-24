@@ -920,6 +920,89 @@ index bd43109..7c34df1 100644
  }
  
  PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 7360ed9..3841acf 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <cctype>
++#include <cstdio>
+ #include <utility>
+ 
+ #include <rex/assert.h>
+@@ -32,6 +33,15 @@ REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
+ REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
+                     "Enable letterboxing for non-native aspect ratios");
+ 
++REXCVAR_DEFINE_STRING(present_aspect_mode, "letterbox", "UI/Presenter",
++                      "How guest output is fitted to the surface: letterbox (black bars), "
++                      "stretch (distort to fill) or crop (zoom to fill, cropping overflow)")
++    .allowed({"letterbox", "stretch", "crop"});
++
++REXCVAR_DEFINE_STRING(present_aspect_ratio, "auto", "UI/Presenter",
++                      "Aspect ratio to present the guest output at, as W:H (for example "
++                      "4:3, 16:9, 16:10, 21:9), or auto to use the guest video mode");
++
+ REXCVAR_DEFINE_INT32(present_safe_area_x, 90, "UI/Presenter",
+                      "Horizontal safe area percentage (0-100)")
+     .range(0, 100);
+@@ -556,6 +566,18 @@ bool Presenter::RefreshGuestOutput(
+   writable_properties.frontbuffer_height = frontbuffer_height;
+   writable_properties.display_aspect_ratio_x = display_aspect_ratio_x;
+   writable_properties.display_aspect_ratio_y = display_aspect_ratio_y;
++  {
++    // Optional presentation aspect ratio override ("4:3", "16:10", "21:9", ...).
++    // "auto" keeps the guest video mode's aspect.
++    const std::string& override_ar = REXCVAR_GET(present_aspect_ratio);
++    if (override_ar != "auto") {
++      unsigned int ax = 0, ay = 0;
++      if (std::sscanf(override_ar.c_str(), "%u:%u", &ax, &ay) == 2 && ax && ay) {
++        writable_properties.display_aspect_ratio_x = ax;
++        writable_properties.display_aspect_ratio_y = ay;
++      }
++    }
++  }
+   writable_properties.is_8bpc = false;
+   bool is_active = writable_properties.IsActive();
+   if (is_active) {
+@@ -899,7 +921,34 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+   // All host location calculations are DPI-independent, conceptually depending
+   // only on the aspect ratios, not the absolute values.
+   uint32_t output_width, output_height;
+-  if (uint64_t(surface_width_in_paint_connection_) * properties.display_aspect_ratio_y >
++  const std::string& aspect_mode = REXCVAR_GET(present_aspect_mode);
++  if (aspect_mode == "stretch") {
++    // Stretch to fill the entire surface, ignoring the aspect ratio (e.g.
++    // filling an ultrawide monitor with 16:9 guest output).
++    output_width = surface_width_in_paint_connection_;
++    output_height = surface_height_in_paint_connection_;
++    flow.output_x = 0;
++    flow.output_y = 0;
++  } else if (aspect_mode == "crop") {
++    // Zoom to cover the entire surface while preserving the aspect ratio,
++    // cropping the overflow on the shorter axis (no distortion).
++    if (uint64_t(surface_width_in_paint_connection_) * properties.display_aspect_ratio_y >
++        uint64_t(surface_height_in_paint_connection_) * properties.display_aspect_ratio_x) {
++      // The window is wider than the source - fill the width, crop along Y.
++      output_width = surface_width_in_paint_connection_;
++      output_height = rescale_unsigned(surface_width_in_paint_connection_,
++                                       properties.display_aspect_ratio_y,
++                                       properties.display_aspect_ratio_x);
++    } else {
++      // The window is taller than the source - fill the height, crop along X.
++      output_height = surface_height_in_paint_connection_;
++      output_width = rescale_unsigned(surface_height_in_paint_connection_,
++                                      properties.display_aspect_ratio_x,
++                                      properties.display_aspect_ratio_y);
++    }
++    flow.output_x = (int32_t(surface_width_in_paint_connection_) - int32_t(output_width)) / 2;
++    flow.output_y = (int32_t(surface_height_in_paint_connection_) - int32_t(output_height)) / 2;
++  } else if (uint64_t(surface_width_in_paint_connection_) * properties.display_aspect_ratio_y >
+       uint64_t(surface_height_in_paint_connection_) * properties.display_aspect_ratio_x) {
+     // The window is wider that the source - crop along Y to preserve the aspect
+     // ratio while stretching throughout the entire surface's width, then limit
 diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
 index b94fe9e..8e5f781 100644
 --- a/src/ui/rex_app.cpp
@@ -942,3 +1025,9 @@ index b94fe9e..8e5f781 100644
          if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_)
            return true;
          return !imgui_drawer_->GetIO().WantCaptureMouse;
+diff --git a/thirdparty/libmspack b/thirdparty/libmspack
+--- a/thirdparty/libmspack
++++ b/thirdparty/libmspack
+@@ -1 +1 @@
+-Subproject commit 305907723a4e7ab2018e58040059ffb5e77db837
++Subproject commit 305907723a4e7ab2018e58040059ffb5e77db837-dirty
