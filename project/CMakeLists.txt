@@ -1,7 +1,7 @@
 # Saints Row PC - builds saintsrow.exe from the ReXGlue SDK, the code generated
 # from your own copy of the game (see scripts/setup.ps1) and the sources in src/.
 cmake_minimum_required(VERSION 3.25)
-project(saintsrow LANGUAGES CXX)
+project(saintsrow LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,9 +17,62 @@ if(NOT EXISTS "${SR_GENERATED_DIR}/sources.cmake")
     message(FATAL_ERROR "Generated code not found in ${SR_GENERATED_DIR}. Run setup.bat first.")
 endif()
 
+# ---------------------------------------------------------------------------
+# Whompay's Mod Loader dependencies (downloaded at configure time)
+# ---------------------------------------------------------------------------
+include(FetchContent)
+# SOURCE_SUBDIR points at a folder without a CMakeLists.txt, so the sources
+# are only downloaded; the libraries are defined below.
+FetchContent_Declare(lua
+    GIT_REPOSITORY https://github.com/lua/lua.git
+    GIT_TAG v5.4.7
+    GIT_SHALLOW TRUE
+    SOURCE_SUBDIR no-cmake)
+FetchContent_Declare(minhook
+    GIT_REPOSITORY https://github.com/TsudaKageyu/minhook.git
+    GIT_TAG v1.3.4
+    GIT_SHALLOW TRUE
+    SOURCE_SUBDIR no-cmake)
+FetchContent_Declare(zlib
+    GIT_REPOSITORY https://github.com/madler/zlib.git
+    GIT_TAG v1.3.1
+    GIT_SHALLOW TRUE
+    SOURCE_SUBDIR no-cmake)
+FetchContent_MakeAvailable(lua minhook zlib)
+
+add_library(wml_zlib STATIC
+    ${zlib_SOURCE_DIR}/adler32.c ${zlib_SOURCE_DIR}/compress.c ${zlib_SOURCE_DIR}/crc32.c
+    ${zlib_SOURCE_DIR}/deflate.c ${zlib_SOURCE_DIR}/inffast.c ${zlib_SOURCE_DIR}/inflate.c
+    ${zlib_SOURCE_DIR}/inftrees.c ${zlib_SOURCE_DIR}/trees.c ${zlib_SOURCE_DIR}/uncompr.c
+    ${zlib_SOURCE_DIR}/zutil.c)
+target_include_directories(wml_zlib PUBLIC ${zlib_SOURCE_DIR})
+target_compile_definitions(wml_zlib PRIVATE _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE)
+
+file(GLOB WML_LUA_SOURCES ${lua_SOURCE_DIR}/*.c)
+list(FILTER WML_LUA_SOURCES EXCLUDE REGEX "/(lua|luac|onelua|ltests)\\.c$")
+add_library(wml_lua STATIC ${WML_LUA_SOURCES})
+target_include_directories(wml_lua PUBLIC ${lua_SOURCE_DIR})
+target_compile_definitions(wml_lua PRIVATE _CRT_SECURE_NO_WARNINGS)
+
+add_library(wml_minhook STATIC
+    ${minhook_SOURCE_DIR}/src/buffer.c
+    ${minhook_SOURCE_DIR}/src/hook.c
+    ${minhook_SOURCE_DIR}/src/trampoline.c
+    ${minhook_SOURCE_DIR}/src/hde/hde64.c)
+target_include_directories(wml_minhook PUBLIC ${minhook_SOURCE_DIR}/include)
+
 set(SAINTSROW_SOURCES
     src/main.cpp
     src/stubs.cpp
+    src/fps_overlay.cpp
+    src/perf_monitor.cpp
+    src/kbm.cpp
+    src/profiler.cpp
+    src/wml/mod_list.cpp
+    src/wml/mod_loader.cpp
+    src/wml/lua_mods.cpp
+    src/wml/packfile.cpp
+    src/wml/patch_phase.cpp
     ${REXGLUE_SHARE_DIR}/rex_app.cpp
 )
 if(EXISTS "${REXGLUE_SHARE_DIR}/windowed_app_main_sdl.cpp")
@@ -44,9 +97,10 @@ target_compile_definitions(saintsrow PRIVATE _CRT_SECURE_NO_WARNINGS)
 
 target_include_directories(saintsrow PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../modding/include
     ${SR_GENERATED_DIR}
 )
-target_link_libraries(saintsrow PRIVATE rex::runtime rex::gpu-xenos)
+target_link_libraries(saintsrow PRIVATE winmm rex::runtime rex::gpu-xenos wml_lua wml_minhook wml_zlib)
 
 target_compile_options(saintsrow PRIVATE
     -fno-strict-aliasing
@@ -67,3 +121,25 @@ add_custom_command(TARGET saintsrow POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:saintsrow> $<TARGET_FILE_DIR:saintsrow>
     COMMAND_EXPAND_LISTS
 )
+
+# ---------------------------------------------------------------------------
+# Whompay's Mod Loader launcher
+# ---------------------------------------------------------------------------
+add_executable(WhompaysModLoader WIN32
+    launcher/launcher.cpp
+    src/wml/mod_list.cpp)
+target_include_directories(WhompaysModLoader PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(WhompaysModLoader PRIVATE _CRT_SECURE_NO_WARNINGS UNICODE _UNICODE)
+target_compile_options(WhompaysModLoader PRIVATE -fno-char8_t)
+target_link_libraries(WhompaysModLoader PRIVATE comctl32 shell32 ole32 uxtheme)
+
+# Example native mod (built so the examples folder has a ready-to-use DLL).
+add_library(example_native_mod SHARED ../modding/examples/ExampleNative/example_native.c)
+target_include_directories(example_native_mod PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../modding/include)
+set_target_properties(example_native_mod PROPERTIES OUTPUT_NAME "ExampleNative" PREFIX "")
+
+add_library(whompays_trainer SHARED ../modding/mods/WhompaysTrainer/trainer.cpp)
+target_include_directories(whompays_trainer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../modding/include)
+target_link_libraries(whompays_trainer PRIVATE rex::runtime user32 gdi32)
+target_compile_options(whompays_trainer PRIVATE -msse4.1)
+set_target_properties(whompays_trainer PROPERTIES OUTPUT_NAME "WhompaysTrainer" PREFIX "")

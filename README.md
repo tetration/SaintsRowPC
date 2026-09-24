@@ -52,7 +52,8 @@ troubleshooting.
 
 ## Playing
 
-Run `dist\saintsrow.exe`.
+Run `dist\WhompaysModLoader.exe` to pick mods and play, or `dist\saintsrow.exe`
+to play directly.
 
 | Action | Control |
 |---|---|
@@ -71,6 +72,14 @@ Options, set by creating a file next to `saintsrow.exe`:
 | `res_scale.txt` | Internal resolution scale: `1` (720p), `2` (default) or `3`. |
 | `start_windowed` | Start in a window instead of fullscreen. The file can be empty. |
 
+## Mods
+
+Saints Row PC comes with **Whompay's Mod Loader**. Run
+`dist\WhompaysModLoader.exe` to turn mods on or off and change their load
+order, then press Play. Mods can replace game files, run Lua scripts, or load
+C/C++ code that hooks the game's functions. See
+[modding/README.md](modding/README.md) to use or make mods.
+
 ## How it works
 
 The ReXGlue SDK translates every PowerPC function in the game's executable to
@@ -82,6 +91,8 @@ input. This repository adds the Saints Row-specific parts:
 | `config/saintsrow_manifest.toml` | Recompiler configuration: ABI helpers, functions static analysis misses, mid-function hooks |
 | `project/src/stubs.cpp` | Game-specific replacements for recompiled functions and kernel calls |
 | `project/src/main.cpp` | Program entry: memory setup, window, runtime |
+| `project/src/wml`, `project/launcher` | Whompay's Mod Loader and its launcher |
+| `modding` | Mod API header, examples and documentation |
 | `patches/rexglue-sdk.patch` | Changes to the SDK that the game needs |
 | `tools/xiso_extract` | Xbox disc image (XDVDFS) extractor |
 | `scripts/setup.ps1` | The build script behind `setup.bat` |

@@ -1,0 +1,43 @@
+// Whompay's Mod Loader - game side.
+#pragma once
+
+#include <cstdint>
+#include <filesystem>
+#include <functional>
+#include <string>
+
+namespace rex::filesystem {
+class VirtualFileSystem;
+}
+
+namespace wml {
+
+// Reads mods/modlist.ini, runs patch scripts and registers the file
+// replacements of enabled mods. Call after the runtime has mounted the game
+// folder, before the XEX loads.
+void Initialize(const std::filesystem::path& exe_dir, const std::filesystem::path& game_dir,
+                rex::filesystem::VirtualFileSystem* vfs, const std::string& game_mount_path);
+
+// Loads code (DLL) and script (Lua) mods and runs their initialisation.
+// Call after the XEX has been loaded, before the game starts running.
+void Start(uint8_t* guest_base);
+
+// Called once per presented frame from the game's render thread.
+void OnFrame();
+// Called at the game-loop boundary before simulation/render.
+void OnGameFrame();
+
+// True when a mod has taken over a key (wml.take_key), so the game's own
+// keyboard controls should ignore it.
+bool KeyTaken(int virtual_key);
+// Text native mods asked to show over the game (empty = nothing).
+std::string OverlayText();
+// Called (on the game thread) when mod text appears or disappears.
+void SetOverlayTextListener(std::function<void(bool)> listener);
+// True while a mod holds a key down for the keyboard controls (wml.force_key).
+bool KeyForced(int virtual_key);
+// Camera turn (radians, to the right) mods asked for since the last call
+// (wml.turn_camera); the keyboard/mouse camera code applies it.
+double TakeCameraTurn();
+
+}  // namespace wml

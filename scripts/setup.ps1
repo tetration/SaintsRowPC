@@ -211,11 +211,25 @@ Step "Copying the game to dist"
 try {
     Copy-Item -Force -ErrorAction Stop (Join-Path $GameBuild "saintsrow.exe") $Dist
     Copy-Item -Force -ErrorAction Stop (Join-Path $SdkInstall "bin\*.dll") $Dist
+    Copy-Item -Force -ErrorAction Stop (Join-Path $GameBuild "WhompaysModLoader.exe") $Dist
+
+    # Whompay's Mod Loader: the mods folder, bundled mods and examples (off by default).
+    $ModsDir = Join-Path $Dist "mods"
+    New-Item -ItemType Directory -Force -Path $ModsDir | Out-Null
+    $bundled = @(Get-ChildItem -Directory (Join-Path $Root "modding\examples")) +
+               @(Get-ChildItem -Directory (Join-Path $Root "modding\mods"))
+    foreach ($example in $bundled) {
+        $target = Join-Path $ModsDir $example.Name
+        New-Item -ItemType Directory -Force -Path $target | Out-Null
+        Copy-Item -Recurse -Force -ErrorAction Stop -Exclude "*.c","*.cpp","*.ps1" (Join-Path $example.FullName "*") $target
+    }
+    Copy-Item -Force -ErrorAction Stop (Join-Path $GameBuild "ExampleNative.dll") (Join-Path $ModsDir "ExampleNative")
+    Copy-Item -Force -ErrorAction Stop (Join-Path $GameBuild "WhompaysTrainer.dll") (Join-Path $ModsDir "WhompaysTrainer")
 } catch {
     Fail "Could not copy the game to dist ($($_.Exception.Message)). If Saints Row PC is running, close it and run setup again."
 }
 
 Stop-Transcript | Out-Null
-Write-Host "`nDone! Run dist\saintsrow.exe to play." -ForegroundColor Green
+Write-Host "`nDone! Run dist\WhompaysModLoader.exe to choose mods and play, or dist\saintsrow.exe to play directly." -ForegroundColor Green
 Write-Host "F11 toggles fullscreen. See README.md for options."
 if (-not $NoPause) { Read-Host "Press Enter to close" | Out-Null }

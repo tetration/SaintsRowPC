@@ -7,6 +7,9 @@
 
 #include "saintsrow_config.h"
 #include "saintsrow_init.h"
+#include "fps_overlay.h"
+#include "perf_monitor.h"
+#include "wml/mod_loader.h"
 
 #include <rex/graphics/graphics_system.h>
 #include <rex/ppc/function.h>
@@ -93,7 +96,31 @@ PPC_FUNC(sub_825E54A8) {
     if (dev) {
         ForceFrameFlags(base, dev);
     }
+    // The game is held to 60 frames per second at most (it normally caps
+    // itself at 30; mods can raise that).
+    sr::LimitFrameRate(double(sr::g_fps_cap.load(std::memory_order_relaxed)));
+    sr::g_game_frames.fetch_add(1, std::memory_order_relaxed);
+    sr::PerfFrameBegin();
+    wml::OnFrame();
     __imp__sub_825E54A8(ctx, base);
+    // Command buffers run on the GPU thread while the game carries on; keep
+    // at most one frame of them queued.
+    REX_KERNEL_STATE()->emulator()->graphics_system()->SubmitCommandStream(nullptr, 1);
+    sr::PerfFrameEnd();
+}
+
+// WaitForSingleObjectEx (guest wrapper): timed for the performance log.
+extern "C" void __imp__sub_8271C2E8(PPCContext& ctx, uint8_t* base);
+PPC_FUNC(sub_8271C2E8) {
+    if (!sr::PerfTrackWaits()) {
+        __imp__sub_8271C2E8(ctx, base);
+        return;
+    }
+    const uint32_t caller = uint32_t(ctx.lr);
+    const auto t0 = std::chrono::steady_clock::now();
+    __imp__sub_8271C2E8(ctx, base);
+    sr::PerfRecordWait(caller, uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                            std::chrono::steady_clock::now() - t0).count()));
 }
 
 // Per-frame render entry (GL2_Render). The flags at 0x8370E9DF/0x8370E9F6
@@ -115,6 +142,10 @@ PPC_FUNC(sub_82185498) {
     if (!IsGuestImageAddress(PPC_LOAD_U32(0x8370F248))) {
         PPC_STORE_U8(0x8370E9DF, 0);
     }
+    // Run mod callbacks at the game-loop boundary, before the render/update
+    // work driven by the original loop.  Calling them from Present happened
+    // after world simulation, so transforms written by mods were overwritten before the
+    // next visible frame.
     __imp__sub_82185498(ctx, base);
 }
 
@@ -188,7 +219,10 @@ PPC_FUNC(sub_82604C10) {
 // primary ring. This port does not execute the ring; instead each command
 // buffer is handed to the command processor with SubmitCommandStream() at the
 // point D3D queues it (sub_825D3218), which preserves D3D's ordering relative
-// to predicated-tiling replays.
+// to predicated-tiling replays. The call returns once the previous buffer has
+// executed (gpu_async_depth, set in main.cpp), so the game prepares the next
+// buffer while the GPU thread executes this one. The frame-boundary and
+// read-back waits below keep the GPU from falling further behind.
 
 // Ring buffer / render-state init. The main loop re-enters it every frame,
 // but it must run once: later calls return the first call's result. After the
@@ -257,6 +291,7 @@ static std::atomic<uint32_t> g_submitted_ibs{0};
 // Queue an INDIRECT_BUFFER: instead of writing it into the primary ring,
 // execute it on the command processor. r4 points to {dword count, GPU address}.
 PPC_FUNC(sub_825D3218) {
+    sr::PerfCount(sr::kPerfCommandBuffers);
     const uint32_t desc = ctx.r4.u32;
     const uint32_t dwords = GRd32(base, desc + 0);
     const uint32_t gpu_addr = GRd32(base, desc + 4);
@@ -299,6 +334,7 @@ PPC_FUNC(sub_825DF0B8) {
 // bit cleared (restoring it afterwards).
 extern "C" void __imp__sub_825DFBF8(PPCContext& ctx, uint8_t* base);
 PPC_FUNC(sub_825DFBF8) {
+    sr::PerfCount(sr::kPerfTilingReplay);
     const uint32_t dev = ctx.r3.u32;
     if (!dev) {
         __imp__sub_825DFBF8(ctx, base);
@@ -341,7 +377,9 @@ PPC_FUNC(sub_825D2F70) {
             const int end_wait = g_exec_end_wait.load();
             if (pending == 0 && (inside == 0 || end_wait > 0)) break;
             if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(50)) break;
-            if (++spins > 64) {
+            // The executor normally finishes within a millisecond or two, and
+            // sleeping (1 ms or more on Windows) would add that much to the frame.
+            if (++spins > 20000) {
                 std::this_thread::sleep_for(std::chrono::microseconds(50));
             } else {
                 std::this_thread::yield();
@@ -354,6 +392,7 @@ PPC_FUNC(sub_825D2F70) {
 // Executor entry: record its state struct and that it is running.
 extern "C" void __imp__sub_825DF708(PPCContext& ctx, uint8_t* base);
 PPC_FUNC(sub_825DF708) {
+    sr::PerfCount(sr::kPerfTilingExecutor);
     g_exec_state.store(GRd32(base, ctx.r3.u32));
     g_exec_inside.fetch_add(1);
     ++t_in_exec;
@@ -406,6 +445,8 @@ PPC_FUNC(sub_825DF2C0) {
 //     view to its virtual view, which is what the CPU code reads.
 extern "C" void __imp__sub_825DF608(PPCContext& ctx, uint8_t* base);
 PPC_FUNC(sub_825DF608) {
+    // Reads results the GPU writes: let queued command buffers finish first.
+    REX_KERNEL_STATE()->emulator()->graphics_system()->SubmitCommandStream(nullptr, 0);
     auto IsBadBlock = [](uint32_t block, uint32_t end) {
         return end < block + 4 || end - block > 0x100000 || ((end - block - 4) & 15);
     };
