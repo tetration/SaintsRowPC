@@ -51,6 +51,12 @@ REXCVAR_DECLARE(std::string, input_backend);
 // whose target lands inside it is treated like a call through a null pointer.
 static uint64_t g_null_object_host_addr = 0;
 
+// Host address of guest address 0. Usually 0x100000000, but the SDK maps the
+// guest memory higher when that range is taken (some PCs have other software
+// loaded there); the handler below must use the real base or the game crashes
+// at startup.
+static uint64_t g_guest_base = 0x100000000ull;
+
 static void InitNullObjectPage(uint8_t* membase) {
     uint8_t* host = membase + 0x0F000000;
     g_null_object_host_addr = (uint64_t)host;
@@ -101,7 +107,7 @@ static LONG WINAPI NullPageHandler(EXCEPTION_POINTERS* ep) {
         ep->ExceptionRecord->NumberParameters >= 2 &&
         ep->ExceptionRecord->ExceptionInformation[0] == 1) {
         const auto address = ep->ExceptionRecord->ExceptionInformation[1];
-        if (address >= 0x1A0000000ull && address < 0x200000000ull) {
+        if (address >= g_guest_base + 0xA0000000ull && address < g_guest_base + 0x100000000ull) {
             MEMORY_BASIC_INFORMATION info{};
             if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) &&
                 info.State == MEM_COMMIT &&
@@ -220,9 +226,9 @@ static LONG WINAPI NullPageHandler(EXCEPTION_POINTERS* ep) {
 
     if (fault_addr < 0x10000) {
         // Host near-null: handled by the instruction decoder below.
-    } else if (fault_addr >= 0x100000000ull && fault_addr < 0x200000000ull) {
-        // Guest memory (host = 0x100000000 + guest address).
-        const uint32_t guest_addr = (uint32_t)(fault_addr - 0x100000000ull);
+    } else if (fault_addr >= g_guest_base && fault_addr < g_guest_base + 0x100000000ull) {
+        // Guest memory (host = guest base + guest address).
+        const uint32_t guest_addr = (uint32_t)(fault_addr - g_guest_base);
         if (guest_addr < 0x10000000) {
             // Low guest addresses are never used legitimately; treat as null.
             // Inside the zero region, re-commit the 64 KB page (at most 4 times
@@ -619,6 +625,16 @@ public:
                 rex::cvar::SetFlagByName("gpu_async_depth", std::to_string(depth));
                 REXLOG_INFO("GPU command queue depth: {}, max lag {} us", depth, max_lag_us);
             }
+#ifdef _WIN32
+            // Test aid: a file named "test_high_base" next to the exe takes the
+            // usual guest memory address first, so the game runs with its
+            // memory mapped higher, as on PCs where that range is in use.
+            if (FILE* hf = std::fopen("test_high_base", "rb")) {
+                std::fclose(hf);
+                void* taken = VirtualAlloc(reinterpret_cast<void*>(0x100000000ull), 0x10000, MEM_RESERVE, PAGE_NOACCESS);
+                REXLOG_INFO("test_high_base: usual guest memory address {}", taken ? "taken" : "was already in use");
+            }
+#endif
             rex::cvar::SetFlagByName("draw_resolution_scale_x", sv);
             rex::cvar::SetFlagByName("draw_resolution_scale_y", sv);
             REXLOG_INFO("Draw resolution scale: {}x", scale);
@@ -682,6 +698,7 @@ public:
 #ifdef _WIN32
         // Commit the zero region before installing the handler, so near-null
         // reads never fault in the first place.
+        g_guest_base = reinterpret_cast<uint64_t>(runtime_->memory()->virtual_membase());
         InitNullZeroRegion(runtime_->memory()->virtual_membase());
         InitNullObjectPage(runtime_->memory()->virtual_membase());
         g_main_thread_id = GetCurrentThreadId();
