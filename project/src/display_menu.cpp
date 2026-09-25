@@ -15,6 +15,8 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 
+#include "kbm.h"
+
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -145,13 +147,16 @@ DisplaySettingsDialog::DisplaySettingsDialog(rex::ui::ImGuiDrawer* imgui_drawer,
     if (HWND hwnd = static_cast<HWND>(window_->GetNativeWindowHandle())) {
         device_name_ = DeviceNameForWindow(hwnd);
     }
-    // The game hides the cursor; show it while the menu is open.
+    // The game hides the cursor and its mouselook pins it to the window
+    // center; show it and free it while the menu is open.
     window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
+    sr::SetMouseCaptureSuspended(true);
     EnumerateModes();
 }
 
 DisplaySettingsDialog::~DisplaySettingsDialog() {
     window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
+    sr::SetMouseCaptureSuspended(false);
 }
 
 void DisplaySettingsDialog::EnumerateModes() {
