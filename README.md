@@ -1,4 +1,8 @@
-# Saints Row PC
+# Saints Reborn (formerly SaintsRowPC)
+
+Saints Reborn is the new name of the SaintsRowPC project. Nothing else has
+changed: old links to the SaintsRowPC repository lead here, and existing
+installs keep updating as before.
 
 An unofficial native Windows port of **Saints Row** (Xbox 360, 2006). The game's
 PowerPC code is statically recompiled to x86-64 with the
@@ -8,7 +12,7 @@ Windows program rather than under an emulator.
 **This repository contains no game code or data.** You build the game yourself,
 on your own PC, from your own disc.
 
-> Saints Row PC is a fan project. It is not affiliated with, endorsed by or
+> Saints Reborn is a fan project. It is not affiliated with, endorsed by or
 > sponsored by Volition, THQ Nordic, Deep Silver, Plaion or Microsoft.
 
 ## Status
@@ -30,14 +34,14 @@ between controller and keyboard pictures to match what you use.
 
 ## Easy install
 
-Download **SaintsRowPC-Setup.exe** from the
-[latest release](https://github.com/whompay/SaintsRowPC/releases/latest), run
+Download **SaintsReborn-Setup.exe** from the
+[latest release](https://github.com/whompay/SaintsReborn/releases/latest), run
 it, select your `.iso` and press **Install**. Setup downloads and installs
 anything missing (Git, the Visual Studio C++ build tools, the Visual C++
-runtime), builds the game and adds a Saints Row PC shortcut.
+runtime), builds the game and adds a Saints Reborn shortcut.
 
-Already built the game? Run **SaintsRowPC-Updater.exe** from the same release
-and choose your Saints Row PC folder to get the latest patches and the mod
+Already built the game? Run **SaintsReborn-Updater.exe** from the same release
+and choose your Saints Reborn folder to get the latest patches and the mod
 loader. Only what changed is rebuilt.
 
 ## Requirements (manual build)
@@ -55,7 +59,7 @@ loader. Only what changed is rebuilt.
 
 ## Building manually
 
-1. Download this repository to a short path, for example `C:\SaintsRowPC`.
+1. Download this repository to a short path, for example `C:\SaintsReborn`.
 2. Run `setup.bat`.
 3. Select your Saints Row `.iso` when asked.
 
@@ -113,7 +117,7 @@ Options, set by creating a file next to `saintsrow.exe`:
 
 ## Mods
 
-Saints Row PC comes with **Whompay's Mod Loader**. Run
+Saints Reborn comes with **Whompay's Mod Loader**. Run
 `dist\WhompaysModLoader.exe` to turn mods on or off and change their load
 order, then press Play. Mods can replace game files, run Lua scripts, or load
 C/C++ code that hooks the game's functions. See

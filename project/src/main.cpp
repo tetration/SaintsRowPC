@@ -484,7 +484,7 @@ public:
 
         // The window must exist before runtime_->Setup() so the GPU plugin can
         // build a presenting swapchain rather than a headless provider.
-        window_ = rex::ui::Window::Create(app_context(), "Saints Row PC", 1280, 720);
+        window_ = rex::ui::Window::Create(app_context(), "Saints Reborn", 1280, 720);
         if (!window_) {
             REXLOG_ERROR("Failed to create window");
             return false;

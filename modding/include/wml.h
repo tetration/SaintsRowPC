@@ -12,7 +12,7 @@
  * Guest addresses are Xbox 360 addresses (e.g. 0x82000000 for code). Values in
  * guest memory are big-endian; the read/write helpers convert for you.
  *
- * Part of Saints Row PC (MIT License).
+ * Part of Saints Reborn (MIT License).
  */
 #ifndef WML_H_
 #define WML_H_

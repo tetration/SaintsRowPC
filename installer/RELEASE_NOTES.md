@@ -1,5 +1,7 @@
 ## What's new in 1.1
 
+- SaintsRowPC is now called **Saints Reborn**. Old links still work, and
+  the updater moves your shortcuts to the new name.
 - Keyboard and mouse controls laid out like Saints Row 2 on PC, and button
   prompts that switch between controller and keyboard pictures (made from your
   own game files during setup).
@@ -21,28 +23,28 @@
   part of the game instead of a mod (it is applied to your own game files
   while the game runs).
 
-Update an existing install with **SaintsRowPC-Updater.exe** (or the **Update
-Saints Row PC** shortcut); your saves and mod list are kept.
+Update an existing install with **SaintsReborn-Updater.exe** (or the **Update
+Saints Reborn** shortcut); your saves and mod list are kept.
 
 ## New install
 
-1. Download **SaintsRowPC-Setup.exe** below and run it.
+1. Download **SaintsReborn-Setup.exe** below and run it.
 2. Select your Saints Row (Xbox 360) disc image (.iso) and an install folder.
 3. Press **Install**. Anything missing (Git, the Visual Studio C++ build
    tools, the Visual C++ runtime) is downloaded and installed for you.
    Windows asks for permission when the build tools are installed.
 
 The build takes 30-90 minutes and needs about 25 GB of free space (including
-the build tools). When it finishes, start the game from the **Saints Row PC**
+the build tools). When it finishes, start the game from the **Saints Reborn**
 shortcut.
 
 ## Already built the game?
 
-Download **SaintsRowPC-Updater.exe**, choose your Saints Row PC folder (the
+Download **SaintsReborn-Updater.exe**, choose your Saints Reborn folder (the
 one with `setup.bat` and `dist`) and press **Update**. It downloads the latest
 patches and Whompay's Mod Loader and rebuilds only what changed. Your game
 files, saves and mod list are kept. Installs made with Setup can also use the
-**Update Saints Row PC** shortcut in the Start menu.
+**Update Saints Reborn** shortcut in the Start menu.
 
 ## Notes
 

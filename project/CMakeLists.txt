@@ -1,4 +1,4 @@
-# Saints Row PC - builds saintsrow.exe from the ReXGlue SDK, the code generated
+# Saints Reborn - builds saintsrow.exe from the ReXGlue SDK, the code generated
 # from your own copy of the game (see scripts/setup.ps1) and the sources in src/.
 cmake_minimum_required(VERSION 3.25)
 project(saintsrow LANGUAGES C CXX)

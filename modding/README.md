@@ -1,6 +1,6 @@
 # Whompay's Mod Loader
 
-Whompay's Mod Loader (WML) lets you turn mods for Saints Row PC on and off, and
+Whompay's Mod Loader (WML) lets you turn mods for Saints Reborn on and off, and
 gives mods four ways to change the game:
 
 | Kind | What it is | Needs compiling |

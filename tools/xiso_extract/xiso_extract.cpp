@@ -4,7 +4,7 @@
 //   xiso_extract <image.iso> <output-dir> [--skip-name NAME ...]
 //
 // Supports plain XISO images and full disc dumps (XGD1/XGD2/XGD3 layouts).
-// Part of Saints Row PC (MIT License).
+// Part of Saints Reborn (MIT License).
 
 #ifdef _WIN32
 #define _CRT_SECURE_NO_WARNINGS
