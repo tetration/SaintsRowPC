@@ -590,12 +590,23 @@ public:
             rex::cvar::SetFlagByName("host_read_cache_mb", std::to_string(ram_cache_mb));
             REXLOG_INFO("Packfile RAM read cache budget: {} MiB (fills on demand)", ram_cache_mb);
             // Let the game prepare the next command buffers while the GPU thread
-            // executes earlier ones (queue depth 8; each queued buffer carries
-            // copies of the command memory it uses). "gpu_queue.txt" next
-            // to the exe sets another depth; a file named "sync_gpu" turns it
-            // off (wait for every buffer, the old behaviour).
+            // executes earlier ones (queue depth 4; each queued buffer carries
+            // copies of the command memory it uses). The GPU thread may also run
+            // at most 4 ms behind: on PCs where it couldn't keep up it fell a
+            // frame or more behind with 8 queued, and the game reused memory the
+            // queued work still needed (garbled graphics, then a crash).
+            // "gpu_queue.txt" next to the exe sets another depth,
+            // "gpu_max_lag.txt" another lag in microseconds (0 = no limit); a file
+            // named "sync_gpu" turns queueing off (wait for every buffer).
             {
-                int depth = 8;
+                int max_lag_us = 4000;
+                if (FILE* lf = std::fopen("gpu_max_lag.txt", "rb")) {
+                    int v = 0;
+                    if (std::fscanf(lf, "%d", &v) == 1 && v >= 0 && v <= 1000000) max_lag_us = v;
+                    std::fclose(lf);
+                }
+                rex::cvar::SetFlagByName("gpu_async_max_lag_us", std::to_string(max_lag_us));
+                int depth = 4;
                 if (FILE* qf = std::fopen("gpu_queue.txt", "rb")) {
                     int v = 0;
                     if (std::fscanf(qf, "%d", &v) == 1 && v >= 0 && v <= 64) depth = v;
@@ -606,7 +617,7 @@ public:
                     depth = 0;
                 }
                 rex::cvar::SetFlagByName("gpu_async_depth", std::to_string(depth));
-                REXLOG_INFO("GPU command queue depth: {}", depth);
+                REXLOG_INFO("GPU command queue depth: {}, max lag {} us", depth, max_lag_us);
             }
             rex::cvar::SetFlagByName("draw_resolution_scale_x", sv);
             rex::cvar::SetFlagByName("draw_resolution_scale_y", sv);

@@ -18,6 +18,8 @@
 - Cutscenes can be skipped with a mouse click.
 - Smoother frame pacing: more GPU work can be queued safely, fewer stutters.
 - Fixed crashes from the GPU reading command memory the game had already reused.
+- Fixed garbled graphics and crashes on PCs where the GPU thread fell behind
+  the game: it now stays at most a few milliseconds behind.
 - First Person: better seat position in vehicles with a look limit, stays
   above the water while swimming, switches to the normal camera when bailing
   out of a moving car, and no more camera jitter while driving.
