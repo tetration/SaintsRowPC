@@ -113,7 +113,8 @@ Options, set by creating a file next to `saintsrow.exe`:
 | `mouse_sensitivity.txt` | Mouse sensitivity, `1.0` by default. |
 | `fps_cap.txt` | Frame rate cap. F10 writes it for you. |
 | `ram_cache_mb.txt` | Memory for caching reads from the game's packfiles, in MB (`0` turns it off). The default depends on your RAM. |
-| `gpu_queue.txt` | How many GPU command buffers may be queued, `8` by default. `0` waits for every buffer (slower, for troubleshooting). |
+| `gpu_queue.txt` | How many GPU command buffers may be queued, `4` by default. `0` waits for every buffer (slower, for troubleshooting). |
+| `gpu_max_lag.txt` | How far the GPU thread may fall behind the game, in microseconds, `4000` by default. `0` means no limit. |
 | `gpu_timing` | An empty file with this name logs the GPU time per frame by kind of work (draws, render target copies, texture loads, resolves, uploads) every 2 seconds. |
 
 Press **F5** in game to open the display settings menu. It lists every
