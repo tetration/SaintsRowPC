@@ -418,6 +418,15 @@ PPC_FUNC_IMPL(__imp__XamInputGetState) {
     }
   }
   if (player_creation) pause_menu = false;  // Esc in the creator is its own back key
+  // In a cutscene the gameplay camera doesn't run, so a pause toggled there
+  // (Esc to skip, or a stray Start edge) never got cleared and the mouse
+  // clicks went to the pause menu branch instead of skipping. Trust the
+  // active menu screen: only the pause menu screen (0x82FFB84C) is a pause.
+  if (pause_menu && (PPC_LOAD_U8(0x8370D991u) || PPC_LOAD_U8(0x8370D990u)) &&
+      PPC_LOAD_U32(0x839E0DF8u) != 0x82FFB84Cu) {
+    pause_menu = false;
+    g_pause_menu_active = false;
+  }
   Pad k = ReadKeyboard(base, pause_menu, player_creation);
 
   auto now = std::chrono::steady_clock::now();

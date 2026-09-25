@@ -569,10 +569,10 @@ index 0d8f8af..176bac7 100644
      VISIBILITY_INLINES_HIDDEN ON
  )
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index a744375..a2f7de2 100644
+index a744375..b70f3bd 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
-@@ -10,10 +10,15 @@
+@@ -10,10 +10,17 @@
   */
  
  #include <algorithm>
@@ -581,14 +581,16 @@ index a744375..a2f7de2 100644
  #include <cmath>
 +#include <condition_variable>
  #include <cstring>
++#include <functional>
 +#include <future>
 +#include <memory>
  #include <string_view>
++#include <unordered_map>
 +#include <vector>
  
  #include <fmt/format.h>
  
-@@ -37,6 +42,13 @@
+@@ -37,6 +44,13 @@
  
  REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
  
@@ -602,7 +604,7 @@ index a744375..a2f7de2 100644
  REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                      "Refresh page-valid state from GPU-written memory at frame end. "
                      "Disable for minor CPU overhead reduction, but may break memory coherency.")
-@@ -99,6 +111,13 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
+@@ -99,6 +113,22 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
    return ReadbackResolveMode::kDisabled;
  }
  
@@ -613,10 +615,19 @@ index a744375..a2f7de2 100644
 +// Nesting depth of INDIRECT_BUFFER execution on the command processor thread.
 +thread_local int indirect_buffer_depth = 0;
 +
++// Copies of the indirect buffers a queued command stream refers to, taken when
++// it was submitted. With a queue depth above 0 the game carries on while the
++// stream waits, and it reuses its command memory: executing the indirect
++// buffers from guest memory then read whatever the game had written there
++// since (packet overflows, broken resolves, crashes).
++using IbSnapshots = std::unordered_map<uint64_t, std::shared_ptr<std::vector<uint32_t>>>;
++thread_local const IbSnapshots* ib_snapshots = nullptr;
++inline uint64_t IbKey(uint32_t cpu_ptr, uint32_t count) { return (uint64_t(cpu_ptr) << 32) | count; }
++
  }  // namespace
  
  CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
-@@ -158,15 +177,149 @@ void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cach
+@@ -158,15 +188,192 @@ void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cach
                                                 uint32_t title_id, bool blocking) {}
  
  void CommandProcessor::CallInThread(std::function<void()> fn) {
@@ -733,13 +744,56 @@ index a744375..a2f7de2 100644
 +  // A spare dword distinguishes the full linear stream from an empty ring.
 +  auto bytes = std::make_shared<std::vector<uint8_t>>(size_bytes + 4);
 +  std::memcpy(bytes->data(), data, size_bytes);
++  // Queued streams: copy the indirect buffers they refer to now (nested ones
++  // too, as deep as execution goes), while they still hold this stream's data.
++  std::shared_ptr<IbSnapshots> snapshots;
++  if (!REXCVAR_GET(gpu_async_submit) && REXCVAR_GET(gpu_async_depth) > 0) {
++    snapshots = std::make_shared<IbSnapshots>();
++    size_t total = 0;
++    std::function<void(const uint32_t*, uint32_t, int)> scan = [&](const uint32_t* dwords, uint32_t n,
++                                                                   int depth) {
++      uint32_t i = 0;
++      while (i < n) {
++        const uint32_t header = rex::byte_swap(dwords[i]);
++        const uint32_t type = header >> 30;
++        if (type == 0) {
++          i += ((header >> 16) & 0x3FFFu) + 2u;
++        } else if (type == 1) {
++          i += 3u;
++        } else if (type == 2) {
++          i += 1u;
++        } else {
++          const uint32_t opcode = (header >> 8) & 0x7Fu;
++          const uint32_t count = ((header >> 16) & 0x3FFFu) + 1u;
++          if ((opcode == PM4_INDIRECT_BUFFER || opcode == PM4_INDIRECT_BUFFER_PFD) && count >= 2 &&
++              i + 2 < n && depth < 5) {
++            const uint32_t ptr = GpuToCpu(CpuToGpu(rex::byte_swap(dwords[i + 1])));
++            const uint32_t length = rex::byte_swap(dwords[i + 2]) & 0xFFFFFu;
++            const uint64_t key = IbKey(ptr, length);
++            if (length && total + length * 4u < (64u << 20) && !snapshots->count(key)) {
++              const uint32_t* src = SelectGuestDataSource(ptr, length);
++              auto copy = std::make_shared<std::vector<uint32_t>>(length + 1u, 0u);
++              std::memcpy(copy->data(), src, length * sizeof(uint32_t));
++              total += length * 4u;
++              (*snapshots)[key] = copy;
++              scan(copy->data(), length, depth + 1);
++            }
++          }
++          i += count + 1u;
++        }
++      }
++    };
++    scan(reinterpret_cast<const uint32_t*>(bytes->data()), size_bytes / 4u, 0);
++  }
 +  const uint64_t seq = submit_seq.fetch_add(1) + 1;
 +  const uint64_t submit_start = NowUs();
-+  CallInThread([this, bytes, size_bytes, seq]() {
++  CallInThread([this, bytes, size_bytes, seq, snapshots]() {
 +    const uint64_t exec_start = NowUs();
 +    memory::RingBuffer reader(bytes->data(), bytes->size());
 +    reader.set_write_offset(size_bytes);
++    ib_snapshots = snapshots.get();
 +    ExecutePacketsResync(&reader);
++    ib_snapshots = nullptr;
 +    OnPrimaryBufferEnd();
 +    stat_exec_us.fetch_add(NowUs() - exec_start, std::memory_order_relaxed);
 +    MarkDone(seq);
@@ -768,7 +822,7 @@ index a744375..a2f7de2 100644
  void CommandProcessor::InvalidateGpuMemory() {}
  
  ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
-@@ -204,9 +357,16 @@ void CommandProcessor::WorkerThreadMain() {
+@@ -204,9 +411,16 @@ void CommandProcessor::WorkerThreadMain() {
    }
  
    while (worker_running_) {
@@ -788,7 +842,7 @@ index a744375..a2f7de2 100644
        fn();
      }
  
-@@ -229,10 +389,10 @@ void CommandProcessor::WorkerThreadMain() {
+@@ -229,10 +443,10 @@ void CommandProcessor::WorkerThreadMain() {
          rex::thread::MaybeYield();
          loop_count++;
          write_ptr_index = write_ptr_index_.load();
@@ -801,7 +855,7 @@ index a744375..a2f7de2 100644
          continue;
        }
      }
-@@ -341,6 +501,12 @@ uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
+@@ -341,6 +555,12 @@ uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
  }
  
  void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
@@ -814,7 +868,7 @@ index a744375..a2f7de2 100644
    RegisterFile& regs = *register_file_;
    if (index >= RegisterFile::kRegisterCount) {
      auto [it, inserted] = extended_register_values_.insert_or_assign(index, value);
-@@ -355,9 +521,8 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+@@ -355,9 +575,8 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
  
    // Volatile for the WAIT_REG_MEM loop.
    const_cast<volatile uint32_t&>(regs.values[index]) = value;
@@ -826,7 +880,7 @@ index a744375..a2f7de2 100644
  
    // Scratch register writeback.
    if (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) {
-@@ -619,14 +784,7 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+@@ -619,14 +838,7 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
    memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
    reader.set_read_offset(read_index * sizeof(uint32_t));
    reader.set_write_offset(write_index * sizeof(uint32_t));
@@ -842,7 +896,7 @@ index a744375..a2f7de2 100644
  
    OnPrimaryBufferEnd();
  
-@@ -636,30 +794,85 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+@@ -636,30 +848,91 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
  void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
    SCOPE_profile_cpu_f("gpu");
  
@@ -854,8 +908,14 @@ index a744375..a2f7de2 100644
 +    return;
 +  }
 +
-+  uint8_t* ib_data =
-+      reinterpret_cast<uint8_t*>(const_cast<uint32_t*>(SelectGuestDataSource(ptr, count)));
++  uint8_t* ib_data = nullptr;
++  if (ib_snapshots) {
++    auto it = ib_snapshots->find(IbKey(ptr, count));
++    if (it != ib_snapshots->end()) ib_data = reinterpret_cast<uint8_t*>(it->second->data());
++  }
++  if (!ib_data) {
++    ib_data = reinterpret_cast<uint8_t*>(const_cast<uint32_t*>(SelectGuestDataSource(ptr, count)));
++  }
 +
    // Execute commands!
 -  memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
@@ -940,7 +1000,7 @@ index a744375..a2f7de2 100644
  }
  
  bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
-@@ -702,6 +915,12 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
+@@ -702,6 +975,12 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
  
    uint32_t base_index = (packet & 0x7FFF);
    uint32_t write_one_reg = (packet >> 15) & 0x1;
@@ -953,7 +1013,7 @@ index a744375..a2f7de2 100644
    for (uint32_t m = 0; m < count; m++) {
      uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
      uint32_t target_index = write_one_reg ? base_index : base_index + m;
-@@ -880,9 +1099,10 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
+@@ -880,9 +1159,10 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
      }
  
      default:
@@ -965,7 +1025,7 @@ index a744375..a2f7de2 100644
        break;
    }
  
-@@ -989,8 +1209,30 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -989,8 +1269,30 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
  
    bool is_memory = (wait_info & 0x10) != 0;
  
@@ -996,7 +1056,7 @@ index a744375..a2f7de2 100644
      uint32_t value = 0;
      if (is_memory) {
        value =
-@@ -1033,8 +1275,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -1033,8 +1335,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
        // Wait.
        if (wait >= 0x100) {
          PrepareForWait();
@@ -1010,7 +1070,7 @@ index a744375..a2f7de2 100644
            rex::thread::MaybeYield();
          } else {
            rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
-@@ -1052,6 +1297,13 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -1052,6 +1357,13 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
      }
    } while (!matched);
  
@@ -1024,7 +1084,7 @@ index a744375..a2f7de2 100644
    return true;
  }
  
-@@ -1469,6 +1721,29 @@ bool CommandProcessor::ExecutePacketType3_SET_CONSTANT2(memory::RingBuffer* read
+@@ -1469,6 +1781,29 @@ bool CommandProcessor::ExecutePacketType3_SET_CONSTANT2(memory::RingBuffer* read
    return true;
  }
  
@@ -1054,7 +1114,7 @@ index a744375..a2f7de2 100644
  bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer* reader,
                                                              uint32_t packet, uint32_t count) {
    // load constants from memory
-@@ -1479,7 +1754,7 @@ bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer*
+@@ -1479,7 +1814,7 @@ bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer*
    uint32_t size_dwords = reader->ReadAndSwap<uint32_t>();
    size_dwords &= 0xFFF;
    uint32_t type = (offset_type >> 16) & 0xFF;
@@ -1063,7 +1123,7 @@ index a744375..a2f7de2 100644
    switch (type) {
      case 0:  // ALU
        WriteALURangeFromMem(index, xlat_address, size_dwords);
-@@ -1525,7 +1800,8 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
+@@ -1525,7 +1860,8 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
    assert_true(start == 0);
  
    auto shader =
