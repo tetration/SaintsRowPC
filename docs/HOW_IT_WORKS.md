@@ -55,6 +55,27 @@ that call the original where appropriate:
 - **System.** Sign-in and content-licence queries report a signed-in local
   profile and the full game.
 
+`project/src/kbm.cpp` turns the keyboard and mouse into controller input,
+laid out like Saints Row 2 on PC. The mouse turns the gameplay camera directly
+(bypassing the game's stick acceleration), points in the weapon wheel, pans the
+pause map and, while tagging, turns the left stick in the direction it moves.
+Keys mean different things on foot, in vehicles, in menus and in the character
+creator; the game's own state tells which applies.
+
+`project/src/glyphs.cpp` swaps the button prompts. The game draws them from
+DXT textures (HUD sprite sheets, the `px_btn*` textures and button characters
+in its fonts). `dist\kbm_ui.bin` holds, for each of these, the original blocks
+and a keyboard/mouse version for each context. A background thread finds the
+loaded textures in guest memory when the input device or context changes and
+writes the matching version; the GPU texture cache sees the write and uploads
+it. The file contains parts of the game's textures, so it is never distributed:
+`tools/glyphgen` builds it during setup from the player's own packfiles and our
+own pictures (`tools/glyphgen/art.png`).
+
+Performance: the guest C library's `memset` and `memcpy` run natively; a
+background copy of the game (for example a second window) is limited to 30 FPS;
+the frame rate cap uses a waitable timer.
+
 `project/src/main.cpp` sets up guest memory (including the low "null page" the
 game expects to be readable), creates the window, loads the GPU backend and
 starts the game.
@@ -88,3 +109,12 @@ starts the game.
   every query as visible.
 - **Calls to unknown functions** return 0 instead of terminating the program.
 - **Input** is ignored while the window is not focused.
+- **Guest interrupt locks.** Recompiled code that turns interrupts off used to
+  take one process-wide lock (and `mfmsr` locked and unlocked it every time).
+  On the console this only stops the current hardware thread being preempted,
+  and the code it protects already uses atomic reservations, so the lock is now
+  per thread. `REX_GUEST_GLOBAL_LOCK=1` restores the old behaviour.
+- **Packfile read cache.** Repeated reads from the game's read-only packfiles
+  are served from a RAM cache (budget set with `ram_cache_mb.txt`).
+- **Frame pacing.** Guest vertical blanks can follow the frame rate cap, so
+  frame caps above 60 work with the 60 FPS mod.

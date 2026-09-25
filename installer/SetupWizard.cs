@@ -21,14 +21,14 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("Saints Row PC Setup")]
 [assembly: AssemblyProduct("Saints Row PC")]
 [assembly: AssemblyCompany("whompay")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
 
 namespace SaintsRowPCSetup
 {
     static class Config
     {
-        public const string Version = "1.0.0";
+        public const string Version = "1.1.0";
         public const string RepoUrl = "https://github.com/whompay/SaintsRowPC.git";
         public const string RepoPage = "https://github.com/whompay/SaintsRowPC";
         public const string Branch = "main";

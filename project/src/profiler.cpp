@@ -38,6 +38,28 @@ struct Module {
 std::vector<Module> g_modules;
 std::vector<std::pair<uintptr_t, uint32_t>> g_guest;  // host address -> guest address
 uintptr_t g_exe_base = 0, g_exe_end = 0;
+std::vector<std::pair<uint32_t, std::string>> g_map;  // exe RVA -> linker map symbol
+
+// saintsrow.map (written by the linker, copied next to the exe) names the
+// host code in the executable, e.g. overrides and import thunks, which the
+// guest function table can't.
+void LoadMap() {
+  FILE* f = std::fopen("saintsrow.map", "rb");
+  if (!f) return;
+  char line[1024];
+  unsigned long long preferred = 0x140000000ull;
+  while (std::fgets(line, sizeof(line), f)) {
+    unsigned long long p = 0;
+    if (std::sscanf(line, " Preferred load address is %llx", &p) == 1) { preferred = p; continue; }
+    unsigned sec = 0, off = 0;
+    char name[512];
+    unsigned long long address = 0;
+    if (std::sscanf(line, " %x:%x %511s %llx", &sec, &off, name, &address) == 4 && sec && address > preferred)
+      g_map.emplace_back(uint32_t(address - preferred), name);
+  }
+  std::fclose(f);
+  std::sort(g_map.begin(), g_map.end());
+}
 
 void LoadModules() {
   HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
@@ -77,6 +99,7 @@ void LoadModules() {
     g_guest.emplace_back(uintptr_t(f->host), uint32_t(f->guest));
   }
   std::sort(g_guest.begin(), g_guest.end());
+  LoadMap();
 }
 
 std::string Resolve(uintptr_t address) {
@@ -84,6 +107,17 @@ std::string Resolve(uintptr_t address) {
   if (address >= g_exe_base && address < g_exe_end && !g_guest.empty()) {
     auto it = std::upper_bound(g_guest.begin(), g_guest.end(),
                                std::make_pair(address, uint32_t(0xFFFFFFFF)));
+    const uint32_t rva = uint32_t(address - g_exe_base);
+    auto mit = std::upper_bound(g_map.begin(), g_map.end(), std::make_pair(rva, std::string("\xff")));
+    if (mit != g_map.begin()) {
+      --mit;
+      // A linker symbol closer than the guest function start is the better name.
+      if (it == g_guest.begin() || mit->first >= uint32_t(std::prev(it)->first - g_exe_base)) {
+        if (mit->second.rfind("sub_", 0) == 0) return mit->second;
+        std::snprintf(text, sizeof(text), "exe!%s", mit->second.c_str());
+        return text;
+      }
+    }
     if (it != g_guest.begin()) {
       --it;
       if (address - it->first < 0x40000) {
@@ -145,10 +179,13 @@ struct Target {
   std::unordered_map<uintptr_t, uint64_t> leaf;             // raw leaf address
   std::unordered_map<std::string, uint64_t> exclusive;      // resolved leaf
   std::unordered_map<std::string, uint64_t> inclusive;      // resolved, per sample once
+  std::unordered_map<std::string, uint64_t> via;            // host leaf: nearest game function
 };
 
 bool FindTargets(std::vector<Target>& targets) {
-  const char* wanted[] = {"GPU Commands", "Main XThread"};
+  // The render thread, the game's main thread, and every other guest thread
+  // (the game's workers and jobs).
+  const char* wanted[] = {"GPU Commands", "Main XThread", "XThread"};
   HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
   if (snap == INVALID_HANDLE_VALUE) return false;
   THREADENTRY32 te{};
@@ -164,20 +201,21 @@ bool FindTargets(std::vector<Target>& targets) {
     for (const char* w : wanted) {
       if (name.rfind(w, 0) == 0) {
         bool dup = false;
-        for (auto& t : targets) dup |= t.label.rfind(w, 0) == 0;
-        if (!dup) {
+        for (auto& t : targets) dup |= t.label == name;
+        if (!dup && targets.size() < 24) {
           Target t;
           t.label = name;
           t.handle = h;
           targets.push_back(std::move(t));
           keep = true;
         }
+        break;
       }
     }
     if (!keep) CloseHandle(h);
   }
   CloseHandle(snap);
-  return targets.size() == 2;
+  return targets.size() >= 2;
 }
 
 constexpr int kMaxDepth = 24;
@@ -226,10 +264,12 @@ void Report(std::vector<Target>& targets) {
       REXLOG_INFO("{}", line);
     };
     dump("self", t.exclusive, 40);
-    dump("total", t.inclusive, 140);
+    dump("total", t.inclusive, 60);
+    dump("host-time-via", t.via, 30);
     t.samples = 0;
     t.exclusive.clear();
     t.inclusive.clear();
+    t.via.clear();
   }
 }
 
@@ -259,7 +299,31 @@ void Loop() {
       int n = Capture(t.handle, frames);
       if (!n) continue;
       ++t.samples;
-      t.exclusive[name_of(frames[0])]++;
+      const std::string& leaf = name_of(frames[0]);
+      t.exclusive[leaf]++;
+      // Time spent in host code (locks, waits, runtime): charge it to the game
+      // function that called into it, with the host function it ended in.
+      auto is_game = [](const std::string& n) {
+        return n.rfind("sub_", 0) == 0 || n.rfind("exe!__imp__sub_", 0) == 0;
+      };
+      if (!is_game(leaf)) {
+        // The nearest runtime (rexruntime) frame says which kernel service
+        // it was; the nearest game function says who asked for it.
+        const std::string* runtime = nullptr;
+        for (int i = 1; i < n; ++i) {
+          const std::string& s = name_of(frames[i]);
+          if (!runtime && s.rfind("rexruntime.dll!", 0) == 0 && s.find("HostToGuest") == std::string::npos &&
+              s.find("thread::Wait") == std::string::npos)
+            runtime = &s;
+          if (is_game(s)) {
+            char rva[48] = "";
+            if (frames[i] >= g_exe_base && frames[i] < g_exe_end)
+              std::snprintf(rva, sizeof(rva), "@exe+%llX", (unsigned long long)(frames[i] - g_exe_base));
+            t.via[s + rva + " > " + (runtime ? *runtime + " > " : std::string()) + leaf]++;
+            break;
+          }
+        }
+      }
       std::vector<const std::string*> seen;
       for (int i = 0; i < n; ++i) {
         const std::string& s = name_of(frames[i]);
@@ -271,6 +335,9 @@ void Loop() {
     if (std::chrono::steady_clock::now() >= next_report) {
       Report(targets);
       next_report += std::chrono::seconds(10);
+      // Guest threads come and go; look again next time.
+      for (auto& t : targets) CloseHandle(t.handle);
+      targets.clear();
     }
   }
   for (auto& t : targets) CloseHandle(t.handle);

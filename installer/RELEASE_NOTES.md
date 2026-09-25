@@ -1,3 +1,29 @@
+## What's new in 1.1
+
+- Keyboard and mouse controls laid out like Saints Row 2 on PC, and button
+  prompts that switch between controller and keyboard pictures (made from your
+  own game files during setup).
+- Tagging can be done with the mouse: move it in circles the way the arrows
+  show.
+- F10 cycles the frame rate cap (30 / 60 / 90 / 120 with the 60 FPS mod), F1
+  shows the frame rate.
+- New bundled mods: **First Person** (V) and **Whompays Trainer** (F4); Living
+  Stilwater draws cars and people further away.
+- Smoother and faster: cheaper guest locks, native memory copies, a RAM cache
+  for the game's packfiles, and less background work for the button prompts.
+- Character creator controls for keyboard and mouse, and X / Y keys in the
+  menus (for example Select Device).
+- Cutscenes can be skipped with a mouse click.
+- First Person: better seat position in vehicles with a look limit, stays
+  above the water while swimming, switches to the normal camera when bailing
+  out of a moving car, and no more camera jitter while driving.
+- The Saints Reborn logo on the startup, main menu and loading screens is now
+  part of the game instead of a mod (it is applied to your own game files
+  while the game runs).
+
+Update an existing install with **SaintsRowPC-Updater.exe** (or the **Update
+Saints Row PC** shortcut); your saves and mod list are kept.
+
 ## New install
 
 1. Download **SaintsRowPC-Setup.exe** below and run it.

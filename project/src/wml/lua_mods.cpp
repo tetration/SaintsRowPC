@@ -39,6 +39,7 @@ extern "C" {
 #endif
 
 #include "wml_internal.h"
+#include "mod_loader.h"
 
 namespace wml {
 namespace {
@@ -49,6 +50,7 @@ struct LuaMod {
   std::string name;
   lua_State* L = nullptr;
   std::recursive_mutex mutex;
+  int lock_depth = 0;  // times the owning thread holds `mutex`
   std::vector<int> frame_callbacks;  // registry refs
   std::vector<std::pair<std::string, std::string>> settings;
   int errors = 0;
@@ -60,15 +62,42 @@ LuaMod* ModOf(lua_State* L) {
   return static_cast<LuaMod*>(lua_touserdata(L, lua_upvalueindex(1)));
 }
 
-void ReportError(LuaMod* mod, const char* where) {
-  const char* message = lua_tostring(mod->L, -1);
+// Holds a mod's Lua lock and counts how deep, so the lock can be let go
+// completely while the game's own code runs (see ReleaseForGameCall).
+struct ModLock {
+  LuaMod* mod;
+  explicit ModLock(LuaMod* m) : mod(m) { mod->mutex.lock(); ++mod->lock_depth; }
+  ~ModLock() { --mod->lock_depth; mod->mutex.unlock(); }
+  ModLock(const ModLock&) = delete;
+  ModLock& operator=(const ModLock&) = delete;
+};
+
+// Lets other threads run this mod's hooks while this thread is inside game
+// code. Every thread runs hooks on its own Lua thread, so their stacks never
+// mix; the lock only keeps two threads from running Lua at the same time.
+struct ReleaseForGameCall {
+  LuaMod* mod;
+  int depth;
+  explicit ReleaseForGameCall(LuaMod* m) : mod(m), depth(m->lock_depth) {
+    mod->lock_depth = 0;
+    for (int i = 0; i < depth; ++i) mod->mutex.unlock();
+  }
+  ~ReleaseForGameCall() {
+    for (int i = 0; i < depth; ++i) mod->mutex.lock();
+    mod->lock_depth = depth;
+  }
+};
+
+void ReportError(LuaMod* mod, const char* where, lua_State* L = nullptr) {
+  if (!L) L = mod->L;
+  const char* message = lua_tostring(L, -1);
   if (mod->errors < kMaxLuaErrorsLogged) {
     Log(mod->name, std::string("Lua error in ") + where + ": " + (message ? message : "?"));
     if (++mod->errors == kMaxLuaErrorsLogged) {
       Log(mod->name, "Too many errors; further errors are not logged");
     }
   }
-  lua_pop(mod->L, 1);
+  lua_pop(L, 1);
 }
 
 uint32_t CheckAddress(lua_State* L, int index) {
@@ -174,7 +203,13 @@ int CtxLr(lua_State* L) {
 int CtxCallOriginal(lua_State* L) {
   auto* c = CheckContext(L);
   c->called_original = true;
-  c->slot->original(*c->ctx, c->base);
+  PPCContext& ctx = *c->ctx;
+  uint8_t* base = c->base;
+  HostFunction original = c->slot->original;
+  {
+    ReleaseForGameCall unlocked(c->slot->mod);
+    original(ctx, base);
+  }
   return 0;
 }
 int CtxCall(lua_State* L) {
@@ -182,7 +217,12 @@ int CtxCall(lua_State* L) {
   uint32_t address = CheckAddress(L, 2);
   HostFunction fn = FindFunction(address);
   if (!fn) return luaL_error(L, "no game function at %08X", (unsigned)address);
-  fn(*c->ctx, c->base);
+  PPCContext& ctx = *c->ctx;
+  uint8_t* base = c->base;
+  {
+    ReleaseForGameCall unlocked(c->slot->mod);
+    fn(ctx, base);
+  }
   return 0;
 }
 
@@ -208,8 +248,17 @@ std::mutex g_hook_slots_mutex;
 // function calls ctx:call_original().
 void RunLuaHook(LuaHookSlot& slot, PPCContext& ctx, uint8_t* base) {
   LuaMod* mod = slot.mod;
-  std::lock_guard<std::recursive_mutex> lock(mod->mutex);
-  lua_State* L = mod->L;
+  ModLock lock(mod);
+  // This OS thread's own Lua thread for the mod, created on first use and
+  // kept for the life of the mod (anchored in the registry).
+  thread_local std::vector<std::pair<LuaMod*, lua_State*>> t_threads;
+  lua_State* L = nullptr;
+  for (auto& t : t_threads) if (t.first == mod) { L = t.second; break; }
+  if (!L) {
+    L = lua_newthread(mod->L);
+    luaL_ref(mod->L, LUA_REGISTRYINDEX);
+    t_threads.emplace_back(mod, L);
+  }
   lua_rawgeti(L, LUA_REGISTRYINDEX, slot.function_ref);
   auto* c = static_cast<LuaContext*>(lua_newuserdatauv(L, sizeof(LuaContext), 0));
   *c = {&ctx, base, &slot, false};
@@ -219,7 +268,7 @@ void RunLuaHook(LuaHookSlot& slot, PPCContext& ctx, uint8_t* base) {
   if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
     char where[48];
     std::snprintf(where, sizeof(where), "hook %08X", (unsigned)slot.address);
-    ReportError(mod, where);
+    ReportError(mod, where, L);
   }
   // The context is only valid during this call.
   lua_rawgeti(L, LUA_REGISTRYINDEX, context_ref);
@@ -284,6 +333,28 @@ int LTakeKey(lua_State* L) {
 }
 int LForceKey(lua_State* L) { ForceKey(CheckKey(L, 1), lua_toboolean(L, 2) != 0); return 0; }
 int LTurnCamera(lua_State* L) { TurnCamera(luaL_checknumber(L, 1)); return 0; }
+// wml.mouse_look() -> yaw, pitch: radians the mouse / right stick would have
+// turned the camera since the last call (positive = right / up).
+int LMouseLook(lua_State* L) {
+  double yaw = 0, pitch = 0;
+  TakeMouseLook(yaw, pitch);
+  lua_pushnumber(L, yaw);
+  lua_pushnumber(L, pitch);
+  return 2;
+}
+// wml.limit_camera(yaw, pitch, yaw_limit, pitch_up, pitch_down) - radians;
+// call every frame while it should apply. wml.limit_camera() turns it off.
+int LLimitCamera(lua_State* L) {
+  CameraLimit l;
+  if (lua_gettop(L) >= 5) {
+    l.active = true;
+    l.yaw = luaL_checknumber(L, 1); l.pitch = luaL_checknumber(L, 2);
+    l.yaw_limit = luaL_checknumber(L, 3); l.pitch_up = luaL_checknumber(L, 4);
+    l.pitch_down = luaL_checknumber(L, 5);
+  }
+  SetCameraLimit(l);
+  return 0;
+}
 
 int LSetting(lua_State* L) { return PushSetting(L, ModOf(L)->settings); }
 
@@ -329,7 +400,8 @@ void OpenWmlLibrary(LuaMod* mod, const ModInfo& info) {
       {"key_down", LKeyDown},     {"key_pressed", LKeyPressed},
       {"on_frame", LOnFrame},     {"hook", LHook},
       {"setting", LSetting},      {"take_key", LTakeKey},
-      {"force_key", LForceKey},   {"turn_camera", LTurnCamera},
+      {"force_key", LForceKey},   {"turn_camera", LTurnCamera}, {"limit_camera", LLimitCamera},
+      {"mouse_look", LMouseLook},
       {nullptr, nullptr}};
   lua_newtable(L);
   lua_pushlightuserdata(L, mod);
@@ -369,7 +441,7 @@ void StartLuaMod(const ModInfo& info) {
   luaL_openlibs(mod->L);
   OpenWmlLibrary(mod.get(), info);
 
-  std::lock_guard<std::recursive_mutex> lock(mod->mutex);
+  ModLock lock(mod.get());
   std::string script = PathToUtf8(info.script);
   if (luaL_loadfile(mod->L, script.c_str()) != LUA_OK || lua_pcall(mod->L, 0, 0, 0) != LUA_OK) {
     ReportError(mod.get(), PathToUtf8(info.script.filename()).c_str());
@@ -382,7 +454,7 @@ void StartLuaMod(const ModInfo& info) {
 void LuaOnFrame() {
   for (auto& mod : g_lua_mods) {
     if (mod->frame_callbacks.empty()) continue;
-    std::lock_guard<std::recursive_mutex> lock(mod->mutex);
+    ModLock lock(mod.get());
     // Index loop: a callback may register more callbacks.
     for (size_t i = 0; i < mod->frame_callbacks.size(); ++i) {
       lua_rawgeti(mod->L, LUA_REGISTRYINDEX, mod->frame_callbacks[i]);

@@ -37,6 +37,12 @@ local height_offset  = wml.setting("height_offset", 0.0)
 local enabled        = wml.setting("start_in_first_person", false)
 local debug          = wml.setting("debug", false)
 local fov            = wml.setting("fov", 75)
+local vehicle_side_offset = wml.setting("vehicle_side_offset", 0.08)
+local vehicle_look_limit  = wml.setting("vehicle_look_limit", 115)
+local vehicle_forward_offset = wml.setting("vehicle_forward_offset", 0.09)
+local vehicle_turn_offset    = wml.setting("vehicle_turn_offset", 0.18)
+local vehicle_look_up     = wml.setting("vehicle_look_up", 35)
+local vehicle_look_down   = wml.setting("vehicle_look_down", 45)
 
 -- Follow camera presets used in normal play (chosen by 0x8210EC20 /
 -- 0x8210EA20): on foot 6, 13, 15, 16, 17, 18; vehicles 7 and 21. Anything
@@ -152,7 +158,8 @@ local function eyes_from_skeleton(player)
     return nil
   end
   -- Only trust something that looks like a head.
-  if not (y > 0.3 and y < 2.2 and math.abs(x) < 1 and math.abs(z) < 1) then return nil end
+  -- (Low and far forward is fine: swimming lays the body flat.)
+  if not (y > -0.3 and y < 2.2 and math.abs(x) < 1.2 and math.abs(z) < 1.5) then return nil end
   return x, y, z
 end
 
@@ -164,7 +171,7 @@ local crouch = 0.0
 local last = {}
 
 -- Where the player's eyes are in the world, or nil.
-local function raw_eye_position()
+local function raw_eye_position(no_look_offset)
   local player = wml.read_u32(PLAYER)
   if player == 0 then return nil end
   local px, py, pz = read_vec(player + 20)
@@ -181,7 +188,7 @@ local function raw_eye_position()
   local fx, fy, fz = read_vec(CAMERA + 104)
   local flat = math.sqrt(fx * fx + fz * fz)
   local ox, oz = 0, 0
-  if flat > 0.001 then
+  if flat > 0.001 and not no_look_offset then
     local amount = forward_offset + math.max(0, -fy) * look_down_offset
     ox, oz = fx / flat * amount, fz / flat * amount
   end
@@ -219,6 +226,15 @@ end
 -- (position +20, rows +32/+44/+56) and only eases towards where the
 -- skeleton says it is.
 local vehicle_eye = nil  -- { vehicle, x, y, z } in the vehicle's frame
+-- Leaning out of the window (shooting from a vehicle): the head leaves its
+-- seated place, and the view follows it. The seated eyes are remembered
+-- relative to the player's body (x right, y up, z forward); when the eyes
+-- move further than a few centimetres from there, the camera moves along.
+-- Measured against the body rather than the world, so a lagging player
+-- position can't shake the view.
+local seat_eyes = nil    -- { vehicle, x, y, z } relative to the player
+local lean_blend = 0
+local seat_vehicle, seat_frames = nil, 0
 -- How far the vehicle moved over the last frame.
 local vehicle_moved, vehicle_last = 0, nil
 wml.on_frame(function()
@@ -234,14 +250,72 @@ wml.on_frame(function()
   end
   vehicle_last = { vehicle, x, y, z }
 end)
+-- Swimming (preset 13): the body lies flat with the head at water level, so
+-- the eyes dip under the surface and show the world from below, where there
+-- is nothing to see. The view is held a little above where the player floats
+-- and bobs gently with the swimming, plus a share of the head's own motion.
+local swim_camera_height = wml.setting("swim_camera_height", 0.25)
+local swim_bob = wml.setting("swim_bob", 0.04)
+local swim_blend, swim_head, swim_t = 0, nil, 0
+wml.on_frame(function() swim_t = swim_t + 1 end)
+local function swim_adjust(x, y, z)
+  local player = wml.read_u32(PLAYER)
+  local py = wml.read_f32(player + 24)
+  -- Standing eyes are ~1.6 m above the player; flat in the water they are
+  -- near the player's own height.
+  local swimming = wml.read_u32(CAMERA_MODE) == 13 and (y - py) < 0.8
+  swim_blend = swim_blend + ((swimming and 1 or 0) - swim_blend) * 0.1
+  if swim_blend < 0.01 then swim_head = nil return x, y, z end
+  swim_head = swim_head and swim_head + (y - swim_head) * 0.05 or y
+  -- Bob only upwards from the set height, so the view never dips under.
+  local bob = (math.sin(swim_t * 0.07) * 0.6 + math.sin(swim_t * 0.031) * 0.4 + 1) * 0.5 * swim_bob
+  local target = py + swim_camera_height + bob
+  return x, y + (target - y) * swim_blend, z
+end
+
 local function eye_position()
-  local x, y, z = raw_eye_position()
-  if not x then return nil end
   local player = wml.read_u32(PLAYER)
   local vehicle = player ~= 0 and player_vehicle(player) or nil
+  -- In a vehicle the eye is kept without the "in front of the eyes" offset;
+  -- that is added below along where the view points, so looking sideways
+  -- or back moves the camera out of the head that way too (a fixed offset
+  -- towards the vehicle's front showed the player's own face when looking
+  -- back).
+  local x, y, z = raw_eye_position(vehicle ~= nil)
+  if not x then return nil end
   if not vehicle then
     vehicle_eye = nil
-    return x, y, z
+    return swim_adjust(x, y, z)
+  end
+  local lean_x, lean_y, lean_z = 0, 0, 0
+  local bx, by, bz = eyes_from_skeleton(player)
+  if seat_vehicle ~= vehicle then seat_vehicle, seat_frames, seat_eyes = vehicle, 0, nil end
+  seat_frames = seat_frames + 1
+  -- The seated eyes are taken once the getting-in animation is over.
+  if bx and not seat_eyes and seat_frames >= 45 then seat_eyes = { vehicle, bx, by, bz } end
+  if bx and seat_eyes then
+    local dx, dy, dz = bx - seat_eyes[2], by - seat_eyes[3], bz - seat_eyes[4]
+    local d = math.sqrt(dx * dx + dy * dy + dz * dz)
+    -- Steering and looking around move the head less than this; leaning
+    -- out of the window to shoot moves it a lot more.
+    local want = math.max(0, math.min(1, (d - 0.18) / 0.15))
+    lean_blend = lean_blend + (want - lean_blend) * 0.25
+    if d < 0.15 then
+      -- Keep following where the head rests while seated.
+      seat_eyes[2] = seat_eyes[2] + dx * 0.02
+      seat_eyes[3] = seat_eyes[3] + dy * 0.02
+      seat_eyes[4] = seat_eyes[4] + dz * 0.02
+    end
+    if lean_blend > 0.001 then
+      local r0x, r0y, r0z = read_vec(player + 32)
+      local r1x, r1y, r1z = read_vec(player + 44)
+      local r2x, r2y, r2z = read_vec(player + 56)
+      lean_x = (dx * r0x + dy * r1x + dz * r2x) * lean_blend
+      lean_y = (dx * r0y + dy * r1y + dz * r2y) * lean_blend
+      lean_z = (dx * r0z + dy * r1z + dz * r2z) * lean_blend
+    end
+  else
+    lean_blend = lean_blend * 0.8
   end
   local vx, vy, vz = read_vec(vehicle + 20)
   local ax, ay, az = read_vec(vehicle + 32)
@@ -253,17 +327,27 @@ local function eye_position()
   local lz = dx * cx + dy * cy + dz * cz
   if not vehicle_eye or vehicle_eye[1] ~= vehicle then
     vehicle_eye = { vehicle, lx, ly, lz }
-  elseif vehicle_moved < 0.02 then
+  elseif vehicle_moved < 0.02 and lean_blend < 0.01 then
     -- Only learn while the vehicle is (nearly) standing still, where a
-    -- lagging player position doesn't matter.
+    -- lagging player position doesn't matter, and not while leaning out.
     vehicle_eye[2] = vehicle_eye[2] + (lx - vehicle_eye[2]) * 0.05
     vehicle_eye[3] = vehicle_eye[3] + (ly - vehicle_eye[3]) * 0.05
     vehicle_eye[4] = vehicle_eye[4] + (lz - vehicle_eye[4]) * 0.05
   end
-  lx, ly, lz = vehicle_eye[2], vehicle_eye[3], vehicle_eye[4]
-  return vx + lx * ax + ly * bx + lz * cx,
-         vy + lx * ay + ly * by + lz * cy,
-         vz + lx * az + ly * bz + lz * cz
+  lx, ly, lz = vehicle_eye[2] + vehicle_side_offset, vehicle_eye[3], vehicle_eye[4]
+  local ex = vx + lx * ax + ly * bx + lz * cx + lean_x
+  local ey = vy + lx * ay + ly * by + lz * cy + lean_y
+  local ez = vz + lx * az + ly * bz + lz * cz + lean_z
+  -- Out of the head along the view: more when looking sideways or back,
+  -- where the head is in the way.
+  local fx, fy, fz = read_vec(CAMERA + 104)
+  local flat = math.sqrt(fx * fx + fz * fz)
+  if flat > 0.001 then
+    local along = (fx * cx + fz * cz) / flat  -- 1 = looking ahead, -1 = back
+    local amount = vehicle_forward_offset + (1 - along) * 0.5 * vehicle_turn_offset
+    ex, ez = ex + fx / flat * amount, ez + fz / flat * amount
+  end
+  return ex, ey, ez
 end
 
 -- On foot, the body turns to where the camera looks (the game builds the
@@ -305,6 +389,27 @@ local follow_camera_frame = -100
 wml.on_frame(function() game_frame = game_frame + 1 end)
 local function follow_camera_recent() return game_frame - follow_camera_frame <= 3 end
 
+-- In a vehicle the view may turn only so far from where the vehicle points
+-- (far enough to look over a shoulder), and tilt only so far up and down.
+-- The mouse camera code drops turning past these limits (wml.limit_camera
+-- is called every frame while they apply).
+local function angle_diff(a, b)
+  local d = a - b
+  while d > math.pi do d = d - 2 * math.pi end
+  while d < -math.pi do d = d + 2 * math.pi end
+  return d
+end
+local function limit_vehicle_look(active)
+  local player = wml.read_u32(PLAYER)
+  local vehicle = active and player ~= 0 and player_vehicle(player) or nil
+  if not vehicle then wml.limit_camera() return end
+  local fx, fy, fz = read_vec(CAMERA + 104)
+  local vx, _, vz = read_vec(vehicle + 56)
+  local yaw = angle_diff(math.atan(fx, fz), math.atan(vx, vz))
+  local pitch = math.asin(math.max(-1, math.min(1, fy)))
+  wml.limit_camera(yaw, pitch, math.rad(vehicle_look_limit), math.rad(vehicle_look_up), math.rad(vehicle_look_down))
+end
+
 wml.hook(FOLLOW_CAMERA, function(ctx)
   ctx:call_original()
   check_store(ctx)
@@ -340,8 +445,162 @@ local function unfade_player()
   wml.write_f32(player + 2484, 1.0)
 end
 
+-- The follow camera doesn't run every frame, and the preset changes for a
+-- frame or two in some moves; judging each frame on its own switched the
+-- view back and forth. So first person stays on through short gaps, and
+-- only a shop, a cutscene or another camera type turns it off at once.
+-- In a vehicle the view direction (final orientation, rows at +80/+92/+104)
+-- sometimes jumped far off for a frame and back (seen as the view flickering
+-- to random directions). Mouse turning there is limited to 6 radians per
+-- second (kbm.cpp), a few degrees a frame, so a bigger jump in one frame is
+-- not the player: the previous direction is kept. A new direction that holds
+-- for several frames (looking back with X, a scripted turn) is taken.
+local view_kept, view_pending, view_pending_frames = nil, nil, 0
+local view_jumps_held = 0
+local function read_rows()
+  local r = {}
+  for i = 0, 8 do r[i + 1] = wml.read_f32(CAMERA + 80 + i * 4) end
+  return r
+end
+local function write_rows(r)
+  for i = 0, 8 do wml.write_f32(CAMERA + 80 + i * 4, r[i + 1]) end
+end
+local function view_angle(a, b)
+  local d = a[7] * b[7] + a[8] * b[8] + a[9] * b[9]
+  return math.acos(math.max(-1, math.min(1, d)))
+end
+local VIEW_JUMP = math.rad(25)
+local function steady_view(in_vehicle)
+  if not in_vehicle then view_kept, view_pending = nil, nil return end
+  local cur = read_rows()
+  if not view_kept or view_angle(cur, view_kept) <= VIEW_JUMP then
+    view_kept, view_pending = cur, nil
+    return
+  end
+  if view_pending and view_angle(cur, view_pending) < math.rad(10) then
+    view_pending_frames = view_pending_frames + 1
+  else
+    view_pending, view_pending_frames = cur, 1
+  end
+  if view_pending_frames >= 5 then
+    view_kept, view_pending = cur, nil
+  else
+    write_rows(view_kept)
+    view_jumps_held = view_jumps_held + 1
+  end
+end
+
+local off_frames = 0
+local last_vehicle_speed, was_in_vehicle, bail_until = 0, false, 0
+local was_active = false
+local skeleton_frames = 0
+local jump_max, eye_missing, updates_this_frame = 0, 0, 0
+local frames_no_update, frames_multi_update, diag_frames = 0, 0, 0
+local frames_overwritten, frames_no_follow, overwrite_max = 0, 0, 0
+-- Driving trace: per frame, whether the follow camera ran (F/-), how far the
+-- vehicle moved, how far the eye moved, and how far the game's own camera
+-- position was from the eye. A few traces per session.
+local trace, traces_done, trace_wait = {}, 0, 0
+local frame_eye_step, frame_game_dist = 0, 0
+local trace_last_rel = nil
+wml.on_frame(function()
+  if not was_active then updates_this_frame = 0 return end
+  if updates_this_frame == 0 then frames_no_update = frames_no_update + 1
+  elseif updates_this_frame > 1 then frames_multi_update = frames_multi_update + 1 end
+  updates_this_frame = 0
+  diag_frames = diag_frames + 1
+  if game_frame - follow_camera_frame > 1 then frames_no_follow = frames_no_follow + 1 end
+  trace_wait = trace_wait + 1
+  if debug and traces_done < 4 and trace_wait > 300 and last.vehicle and vehicle_moved > 0.15 then
+    -- Where the view points relative to the vehicle, in degrees, and how
+    -- far the view turned this frame.
+    local fx, fy, fz = read_vec(CAMERA + 104)
+    local player = wml.read_u32(PLAYER)
+    local veh = player ~= 0 and player_vehicle(player)
+    local rel = 0
+    if veh then
+      local cx, _, cz = read_vec(veh + 56)
+      rel = math.deg(math.atan(fx * cz - fz * cx, fx * cx + fz * cz))
+    end
+    local turn = trace_last_rel and rel - trace_last_rel or 0
+    trace_last_rel = rel
+    trace[#trace + 1] = string.format("%s%.2f/%.2f/%.1f/%.1f", game_frame - follow_camera_frame > 1 and "-" or "F",
+      vehicle_moved, frame_eye_step, rel, turn)
+    if #trace >= 20 then
+      wml.log("drive trace: " .. table.concat(trace, " "))
+      trace = {}
+      if trace_wait > 700 then traces_done, trace_wait = traces_done + 1, 0 end
+    end
+  end
+  -- Something else moved the view after the first person camera placed it
+  -- (seen as the view flicking to third person in vehicles): count it and
+  -- put the view back.
+  if last.eye then
+    local x, y, z = read_vec(CAMERA + 44)
+    local dx, dy, dz = x - last.eye[1], y - last.eye[2], z - last.eye[3]
+    local d = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if d > 0.05 then
+      frames_overwritten = frames_overwritten + 1
+      if d > overwrite_max then overwrite_max = d end
+      write_vec(CAMERA + 44, last.eye[1], last.eye[2], last.eye[3])
+    end
+  end
+  if diag_frames >= 60 then
+    local player = wml.read_u32(PLAYER)
+    if debug then wml.log(string.format("first person: %d frames, %d without a camera update, %d with several, eye missing %d, biggest eye step %.2f m | preset %d, player y %.2f, eye y %.2f | moved by something else %d (up to %.2f m), no follow camera %d, view jumps held %d, lean %.2f",
+      diag_frames, frames_no_update, frames_multi_update, eye_missing, jump_max, wml.read_u32(CAMERA_MODE),
+      player ~= 0 and wml.read_f32(player + 24) or 0, last.eye and last.eye[2] or 0,
+      frames_overwritten, overwrite_max, frames_no_follow, view_jumps_held, lean_blend)) end
+    view_jumps_held = 0
+    diag_frames, frames_no_update, frames_multi_update, eye_missing, jump_max = 0, 0, 0, 0, 0
+    frames_overwritten, frames_no_follow, overwrite_max = 0, 0, 0
+  end
+end)
+local active_switches = 0
 wml.hook(CAMERA_UPDATE, function(ctx)
-  local active = enabled and follow_camera_recent() and first_person_allowed()
+  local raw = enabled and follow_camera_recent() and first_person_allowed()
+  -- Tumbling (bailing out of a moving car, knocked down, ragdoll): the eyes
+  -- can't be followed well, so the normal camera shows it until the player
+  -- is back on their feet.
+  local tumbling = false
+  local player = wml.read_u32(PLAYER)
+  -- Bailing out of a moving vehicle: the dive and roll throw the head
+  -- through the body. From leaving a vehicle that was moving (more than
+  -- about 15 km/h) until 2.5 s after, the normal camera is used.
+  if player ~= 0 then
+    local in_vehicle = player_vehicle(player) ~= nil
+    if in_vehicle then
+      last_vehicle_speed = vehicle_moved
+    elseif was_in_vehicle and last_vehicle_speed > 0.07 then
+      bail_until = game_frame + 150
+    end
+    was_in_vehicle = in_vehicle
+    if not in_vehicle and wml.read_u32(player + 2496) ~= 0 and last_vehicle_speed > 0.07 then
+      bail_until = game_frame + 150  -- still on the way out
+    end
+    if game_frame < bail_until then tumbling = true end
+  end
+  if not tumbling and player ~= 0 and not player_vehicle(player) then
+    local _, uy = read_vec(player + 44)
+    local eyes = eyes_from_skeleton(player) ~= nil
+    if eyes then skeleton_frames = skeleton_frames + 1 end
+    -- A missing head only counts once this character's skeleton has been
+    -- read fine (some models can't be read at all and use fixed heights).
+    tumbling = uy < 0.5 or (not eyes and skeleton_frames > 30)
+  end
+  local hard_off = not enabled or store_open or wml.read_u32(CAMERA) ~= 0 or tumbling
+  if raw then off_frames = 0 else off_frames = off_frames + 1 end
+  local active = (raw and not tumbling) or (was_active and not hard_off and off_frames < 20)
+  if active ~= was_active then
+    active_switches = active_switches + 1
+    if debug and active_switches <= 200 then
+      wml.log(string.format("first person %s (follow camera %d frames ago, camera type %d, preset %d, shop %s, tumbling %s)",
+        active and "on" or "off", game_frame - follow_camera_frame, wml.read_u32(CAMERA), wml.read_u32(CAMERA_MODE),
+        tostring(store_open), tostring(tumbling)))
+    end
+  end
+  was_active = active
+  limit_vehicle_look(active)
   if active and not saved_fade_radius then
     saved_fade_radius = wml.read_f32(CAMERA_FADE_RADIUS)
     wml.write_f32(CAMERA_FADE_RADIUS, 0.0)
@@ -350,7 +609,8 @@ wml.hook(CAMERA_UPDATE, function(ctx)
     saved_fade_radius = nil
   end
   ctx:call_original()
-  if not active then return end
+  if not active then view_kept = nil return end
+  steady_view(last.vehicle)
   unfade_player()
   face_camera()
   -- A wider view in first person, so arms and weapons held in front of the
@@ -358,9 +618,22 @@ wml.hook(CAMERA_UPDATE, function(ctx)
   if fov > 0 then wml.write_f32(CAMERA + 188, fov) end
   local x, y, z = eye_position()
   if x then
+    -- Diagnostics for view jumps: how far the eye moved relative to the
+    -- vehicle / player since the previous camera update.
+    if last.eye then
+      local dx, dy, dz = x - last.eye[1], y - last.eye[2], z - last.eye[3]
+      local d = math.sqrt(dx * dx + dy * dy + dz * dz)
+      if d > jump_max then jump_max = d end
+    end
+    local gx, gy, gz = read_vec(CAMERA + 44)
+    frame_game_dist = math.sqrt((gx - x) ^ 2 + (gy - y) ^ 2 + (gz - z) ^ 2)
+    frame_eye_step = last.eye and math.sqrt((x - last.eye[1]) ^ 2 + (y - last.eye[2]) ^ 2 + (z - last.eye[3]) ^ 2) or 0
     write_vec(CAMERA + 44, x, y, z)
     last.eye = { x, y, z }
+  else
+    eye_missing = eye_missing + 1
   end
+  updates_this_frame = updates_this_frame + 1
 end)
 
 local frames = 0

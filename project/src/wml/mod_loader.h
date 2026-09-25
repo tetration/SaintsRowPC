@@ -39,5 +39,20 @@ bool KeyForced(int virtual_key);
 // Camera turn (radians, to the right) mods asked for since the last call
 // (wml.turn_camera); the keyboard/mouse camera code applies it.
 double TakeCameraTurn();
+// Mouse and right stick movement for mods (wml.mouse_look): how far the
+// gameplay camera would turn, in radians, since a mod last asked.
+void AddMouseLook(double yaw, double pitch);
+void TakeMouseLook(double& yaw, double& pitch);
+
+// Limits on turning the camera with the mouse (set by mods each frame).
+// yaw/pitch are the current angles (radians) relative to what they are
+// limited against; turning further than the limits is dropped.
+struct CameraLimit {
+  bool active = false;
+  double yaw = 0, pitch = 0;
+  double yaw_limit = 0, pitch_up = 0, pitch_down = 0;
+};
+void SetCameraLimit(const CameraLimit& limit);
+bool GetCameraLimit(CameraLimit& limit);
 
 }  // namespace wml

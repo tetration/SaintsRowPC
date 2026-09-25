@@ -61,6 +61,8 @@ and a global `wml` table:
 | `wml.take_key(key [, taken])` | Takes a key over: the built-in keyboard controls stop using it, so the mod can give it a new job. `wml.take_key(key, false)` gives it back. |
 | `wml.force_key(key, down)` | Holds a key down (or lets go of it) for the built-in keyboard controls, as if the player pressed it. |
 | `wml.turn_camera(radians)` | Turns the camera, like moving the mouse (positive turns right). |
+| `wml.limit_camera(yaw, pitch, yaw_limit, pitch_up, pitch_down)` | Stops mouse turning past the given limits (all in radians; `yaw` and `pitch` are where the view points now). Call it every frame while it should apply; `wml.limit_camera()` turns it off. |
+| `wml.mouse_look()` | Returns how far the mouse (or the controller's right stick) would have turned the camera since the last call, as `yaw, pitch` in radians (positive = right / up). For mods that steer a view themselves. |
 | `wml.on_frame(function)` | Calls the function once every frame. |
 | `wml.hook(addr, function(ctx) ... end)` | Replaces the game function at `addr`. |
 | `wml.setting(name, default)` | A value from the mod's `[settings]` (see Settings below). |
@@ -181,6 +183,13 @@ DLL, compile it as a 64-bit Windows DLL with any compiler and add
   and times stay close to normal. It edits the spawn tables (patch.lua) and
   lifts the game's fixed limits on how many cars and people it keeps around
   you (main.lua). Tune it in its `mod.ini`.
+- **60 FPS** raises the game's frame rate limit from 30 to 60. With it on, F10
+  cycles the cap between 30, 60, 90 and 120.
+- **First Person** adds a first-person view, toggled with V. It works on foot,
+  swimming and in vehicles (including leaning out to shoot), and switches back
+  to the normal camera in shops, cutscenes and scripted scenes. Settings are in
+  its `mod.ini`.
+- **Whompays Trainer** (F4) gives respect, all guns, money and god mode.
 
 ## Example mods
 

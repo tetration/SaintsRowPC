@@ -1,3 +1,15 @@
+diff --git a/include/rex/filesystem/devices/host_path_file.h b/include/rex/filesystem/devices/host_path_file.h
+index 789315c..eaa592f 100644
+--- a/include/rex/filesystem/devices/host_path_file.h
++++ b/include/rex/filesystem/devices/host_path_file.h
+@@ -36,6 +36,7 @@ class HostPathFile : public File {
+ 
+  private:
+   std::unique_ptr<rex::filesystem::FileHandle> file_handle_;
++  uint64_t read_cache_id_ = 0;
+ };
+ 
+ }  // namespace rex::filesystem
 diff --git a/include/rex/filesystem/vfs.h b/include/rex/filesystem/vfs.h
 index 96f86fe..9377c14 100644
 --- a/include/rex/filesystem/vfs.h
@@ -122,6 +134,19 @@ index ac6b056..2d1e2eb 100644
  
    // May be called from any thread any number of times, even during recovery
    // from a device loss.
+diff --git a/include/rex/input/mnk/mnk_input_driver.h b/include/rex/input/mnk/mnk_input_driver.h
+index c8751b7..bda99c1 100644
+--- a/include/rex/input/mnk/mnk_input_driver.h
++++ b/include/rex/input/mnk/mnk_input_driver.h
+@@ -95,6 +95,8 @@ class MnkInputDriver final : public InputDriver,
+ 
+   // Guest thread to UI thread. The queued flag coalesces the posts.
+   std::atomic<bool> mouse_capture_requested_{false};
++  // UI-published state lets input polling avoid posting unchanged capture work.
++  std::atomic<bool> mouse_capture_applied_{false};
+   std::atomic<bool> mouse_capture_update_queued_{false};
+ 
+   std::atomic<bool> has_focus_{true};
 diff --git a/include/rex/system/interfaces/graphics.h b/include/rex/system/interfaces/graphics.h
 index d54df86..09a0939 100644
 --- a/include/rex/system/interfaces/graphics.h
@@ -135,6 +160,65 @@ index d54df86..09a0939 100644
  };
  
  }  // namespace rex::system
+diff --git a/resources/templates/codegen/pch_h.inja b/resources/templates/codegen/pch_h.inja
+index 68274d2..c4aa730 100644
+--- a/resources/templates/codegen/pch_h.inja
++++ b/resources/templates/codegen/pch_h.inja
+@@ -310,26 +310,36 @@ inline void ppc_trap(PPCContext& ctx, u8* base, u16 trap_type) {
+ // Interrupt Locks
+ //=============================================================================
+ 
+-inline std::atomic<i32>& ppc_global_lock_count_() {
+-  static std::atomic<i32> count{0};
+-  return count;
++// How many times this thread has entered the region (guest "interrupts off").
++inline i32& ppc_global_lock_depth_() {
++  thread_local i32 depth = 0;
++  return depth;
+ }
+ 
+-#define REX_CHECK_GLOBAL_LOCK()                                        \
+-  ([&]() -> u64 {                                                      \
+-    auto lock_ = rex::thread::global_critical_region::AcquireDirect(); \
+-    return ppc_global_lock_count_().load() ? 0 : 0x8000;               \
+-  }())
+-
+-#define REX_ENTER_GLOBAL_LOCK()                          \
+-  do {                                                   \
+-    rex::thread::global_critical_region::mutex().lock(); \
+-    ppc_global_lock_count_().fetch_add(1);               \
++// Reading the MSR only needs this thread's own state; it does not take the
++// lock (it used to lock and unlock the global mutex on every mfmsr).
++#define REX_CHECK_GLOBAL_LOCK() (u64(ppc_global_lock_depth_() ? 0 : 0x8000))
++
++// On the console, turning interrupts off only stops the current hardware
++// thread from being preempted; it never kept other cores out. The guest
++// regions that do it wrap lwarx/stwcx. updates, and stwcx. is already a real
++// compare-and-swap here, so no host lock is needed. Setting the environment
++// variable REX_GUEST_GLOBAL_LOCK=1 brings the old shared lock back.
++inline const bool ppc_guest_global_lock_ = [] {
++  const char* v = std::getenv("REX_GUEST_GLOBAL_LOCK");
++  return v && v[0] == '1';
++}();
++
++#define REX_ENTER_GLOBAL_LOCK()                                         \
++  do {                                                                  \
++    if (ppc_guest_global_lock_)                                         \
++      rex::thread::global_critical_region::mutex().lock();              \
++    ++ppc_global_lock_depth_();                                         \
+   } while (0)
+ 
+-#define REX_LEAVE_GLOBAL_LOCK()                                                           \
+-  do {                                                                                    \
+-    auto old_count_ = ppc_global_lock_count_().fetch_sub(1);                              \
+-    assert(old_count_ >= 1 && "LeaveGlobalLock called without matching EnterGlobalLock"); \
+-    rex::thread::global_critical_region::mutex().unlock();                                \
++#define REX_LEAVE_GLOBAL_LOCK()                                         \
++  do {                                                                  \
++    --ppc_global_lock_depth_();                                         \
++    if (ppc_guest_global_lock_)                                         \
++      rex::thread::global_critical_region::mutex().unlock();            \
+   } while (0)
 diff --git a/src/audio/audio_system.cpp b/src/audio/audio_system.cpp
 index 7a711a8..3bae941 100644
 --- a/src/audio/audio_system.cpp
@@ -215,6 +299,195 @@ index 7a711a8..3bae941 100644
  
    if (out_index) {
      *out_index = index;
+diff --git a/src/filesystem/devices/host_path_file.cpp b/src/filesystem/devices/host_path_file.cpp
+index 4c57a18..57341ec 100644
+--- a/src/filesystem/devices/host_path_file.cpp
++++ b/src/filesystem/devices/host_path_file.cpp
+@@ -11,14 +11,58 @@
+ 
+ #include <rex/filesystem/devices/host_path_entry.h>
+ #include <rex/filesystem/devices/host_path_file.h>
++#include <rex/filesystem/device.h>
++#include <rex/cvar.h>
++#include <rex/logging.h>
++#include <atomic>
++#include <chrono>
++#include "read_cache.h"
++
++REXCVAR_DEFINE_INT32(host_read_cache_mb, 0, "Filesystem", "RAM budget for immutable packfile reads (0 disables)");
+ 
+ namespace rex::filesystem {
+ 
++namespace {
++ReadCache& Cache() { static ReadCache cache; return cache; }
++std::atomic<uint64_t> next_cache_id{1};
++void LogCache() {
++  // Only runs on the IO path. Interval statistics measure actual avoided reads.
++  static std::mutex mutex;
++  std::unique_lock lock(mutex, std::try_to_lock);
++  if (!lock.owns_lock()) return;
++  static auto last = std::chrono::steady_clock::now();
++  auto now = std::chrono::steady_clock::now();
++  double seconds = std::chrono::duration<double>(now - last).count();
++  if (seconds < 2.0) return;
++  static ReadCache::Stats before;
++  auto current = Cache().GetStats();
++  REXLOG_INFO("RAM READ CACHE {} MiB / {} entries | hits {:.0f}/s misses {:.0f}/s | host reads avoided {:.1f} MiB/s",
++      current.bytes >> 20, current.entries, (current.hits - before.hits) / seconds,
++      (current.misses - before.misses) / seconds,
++      (current.saved_bytes - before.saved_bytes) / (1048576.0 * seconds));
++  before = current;
++  last = now;
++}
++}
++
+ HostPathFile::HostPathFile(uint32_t file_access, HostPathEntry* entry,
+                            std::unique_ptr<rex::filesystem::FileHandle> file_handle)
+-    : File(file_access, entry), file_handle_(std::move(file_handle)) {}
++    : File(file_access, entry), file_handle_(std::move(file_handle)) {
++  const auto budget = std::clamp(REXCVAR_GET(host_read_cache_mb), 0, 4096);
++  // Only immutable packfiles on read-only mounts, including mod overlays.
++  // Save files and other writable data always retain the direct IO path.
++  if (budget && entry->device()->is_read_only() &&
++      entry->host_path().extension() == ".vpp_xbox2" &&
++      !(file_access & (FileAccess::kGenericWrite | FileAccess::kFileWriteData |
++                      FileAccess::kFileAppendData | FileAccess::kGenericAll))) {
++    Cache().SetBudget(size_t(budget) * 1024 * 1024);
++    read_cache_id_ = next_cache_id.fetch_add(1, std::memory_order_relaxed);
++  }
++}
+ 
+-HostPathFile::~HostPathFile() = default;
++HostPathFile::~HostPathFile() {
++  if (read_cache_id_) Cache().EraseFile(read_cache_id_);
++}
+ 
+ void HostPathFile::Destroy() {
+   delete this;
+@@ -30,7 +74,17 @@ X_STATUS HostPathFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
+     return X_STATUS_ACCESS_DENIED;
+   }
+ 
++  const bool cacheable = read_cache_id_ && !buffer.empty() && buffer.size() <= 1024 * 1024;
++  if (cacheable && Cache().Read(read_cache_id_, byte_offset, buffer)) {
++    *out_bytes_read = buffer.size();
++    LogCache();
++    return X_STATUS_SUCCESS;
++  }
+   if (file_handle_->Read(byte_offset, buffer.data(), buffer.size(), out_bytes_read)) {
++    if (cacheable && *out_bytes_read == buffer.size()) {
++      Cache().Store(read_cache_id_, byte_offset, buffer);
++      LogCache();
++    }
+     return X_STATUS_SUCCESS;
+   } else {
+     return X_STATUS_END_OF_FILE;
+diff --git a/src/filesystem/devices/read_cache.h b/src/filesystem/devices/read_cache.h
+new file mode 100644
+--- /dev/null
++++ b/src/filesystem/devices/read_cache.h
+@@ -0,0 +1,101 @@
++#pragma once
++
++#include <algorithm>
++#include <cstdint>
++#include <cstring>
++#include <list>
++#include <mutex>
++#include <span>
++#include <unordered_map>
++#include <vector>
++
++namespace rex::filesystem {
++
++// Exact-range cache for immutable game files. Misses retain the original host
++// read, including its short-read/error behavior; only complete reads are stored.
++// IDs belong to open handles, so closing/reopening cannot reuse stale contents.
++class ReadCache {
++ public:
++  struct Stats { uint64_t hits = 0, misses = 0, saved_bytes = 0; size_t bytes = 0, entries = 0; };
++  void SetBudget(size_t bytes) {
++    std::lock_guard lock(mutex_);
++    budget_ = bytes;
++    Trim(0);
++  }
++  bool Read(uint64_t file, size_t offset, std::span<uint8_t> output) {
++    std::lock_guard lock(mutex_);
++    auto it = entries_.find(Key{file, offset, output.size()});
++    if (it == entries_.end()) { ++stats_.misses; return false; }
++    auto node = it->second;
++    std::memcpy(output.data(), node->data.data(), output.size());
++    lru_.splice(lru_.begin(), lru_, node);
++    ++stats_.hits;
++    stats_.saved_bytes += output.size();
++    return true;
++  }
++  void Store(uint64_t file, size_t offset, std::span<const uint8_t> input) {
++    std::lock_guard lock(mutex_);
++    if (input.empty() || input.size() > budget_ || input.size() > 1024 * 1024) return;
++    Key key{file, offset, input.size()};
++    if (entries_.contains(key)) return;
++    // Allocate before changing accounting. Cache failure must not fail the read.
++    try {
++      std::vector<uint8_t> copy(input.begin(), input.end());
++      Trim(input.size());
++      lru_.push_front(Node{key, std::move(copy)});
++      try {
++        entries_.emplace(key, lru_.begin());
++      } catch (...) {
++        lru_.pop_front();
++        throw;
++      }
++      stats_.bytes += input.size();
++    } catch (const std::bad_alloc&) {
++      // The caller already has valid data; caching is optional.
++    }
++  }
++  void EraseFile(uint64_t file) {
++    std::lock_guard lock(mutex_);
++    for (auto it = lru_.begin(); it != lru_.end();) {
++      if (it->key.file != file) { ++it; continue; }
++      stats_.bytes -= it->data.size();
++      entries_.erase(it->key);
++      it = lru_.erase(it);
++    }
++  }
++  Stats GetStats() {
++    std::lock_guard lock(mutex_);
++    auto result = stats_;
++    result.entries = entries_.size();
++    return result;
++  }
++ private:
++  struct Key {
++    uint64_t file;
++    size_t offset, size;
++    bool operator==(const Key&) const = default;
++  };
++  struct Hash {
++    size_t operator()(const Key& key) const {
++      size_t h = std::hash<uint64_t>{}(key.file);
++      h ^= std::hash<size_t>{}(key.offset) + 0x9e3779b9 + (h << 6) + (h >> 2);
++      return h ^ (std::hash<size_t>{}(key.size) + 0x9e3779b9 + (h << 6) + (h >> 2));
++    }
++  };
++  struct Node { Key key; std::vector<uint8_t> data; };
++  void Trim(size_t incoming) {
++    while (!lru_.empty() && (stats_.bytes > budget_ - incoming ||
++           (incoming != 0 && entries_.size() >= 32768))) {
++      auto& node = lru_.back();
++      stats_.bytes -= node.data.size();
++      entries_.erase(node.key);
++      lru_.pop_back();
++    }
++  }
++  std::mutex mutex_;
++  size_t budget_ = 0;
++  Stats stats_;
++  std::list<Node> lru_;
++  std::unordered_map<Key, std::list<Node>::iterator, Hash> entries_;
++};
++}  // namespace rex::filesystem
 diff --git a/src/filesystem/virtual_file_system.cpp b/src/filesystem/virtual_file_system.cpp
 index a1b4dad..c249c5b 100644
 --- a/src/filesystem/virtual_file_system.cpp
@@ -1075,7 +1348,7 @@ index 8f2fcb0..c12df68 100644
    command_processor_->EnableReadPointerWriteBack(ptr, block_size_log2);
  }
 diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
-index 76f5600..4810d79 100644
+index 76f5600..2376290 100644
 --- a/src/graphics/pipeline/texture/cache.cpp
 +++ b/src/graphics/pipeline/texture/cache.cpp
 @@ -10,6 +10,8 @@
@@ -1139,7 +1412,20 @@ index 76f5600..4810d79 100644
    // Check if the texture is a scaled resolve texture.
    if (IsDrawResolutionScaled() && key.tiled && IsScaledResolveSupportedForFormat(key)) {
      texture_util::TextureGuestLayout scaled_resolve_guest_layout = key.GetGuestLayout();
-@@ -867,7 +893,14 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
+@@ -775,6 +801,12 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
+     }
+   }
+ 
++  // Existing entries already passed extent validation when created. This path
++  // is hit tens of thousands of times per second during driving.
++  if (auto found = textures_.find(key); found != textures_.end()) {
++    return found->second.get();
++  }
++
+   auto get_host_extent = [this, &key](uint32_t& host_width_out, uint32_t& host_height_out,
+                                       uint32_t& host_depth_or_array_size_out) {
+     host_width_out = key.GetWidth();
+@@ -867,7 +899,14 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
    // Create the texture and add it to the map.
    Texture* texture;
    {
@@ -1154,7 +1440,7 @@ index 76f5600..4810d79 100644
      if (!new_texture) {
        key.LogAction("Failed to create");
        return nullptr;
-@@ -1035,7 +1068,9 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
+@@ -1035,7 +1074,9 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
    uint32_t block_last = page_last >> 5;
    uint32_t l2_block_first = block_first >> 6;
    uint32_t l2_block_last = block_last >> 6;
@@ -1351,6 +1637,39 @@ index 813bb1c..811d52a 100644
      if (result == X_ERROR_SUCCESS) {
        out_keystroke->user_index = static_cast<uint8_t>(user_index);
        return result;
+diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
+index 3f9422d..943eea5 100644
+--- a/src/input/mnk/mnk_input_driver.cpp
++++ b/src/input/mnk/mnk_input_driver.cpp
+@@ -398,6 +398,12 @@ void MnkInputDriver::EnqueueKeystroke(uint16_t vk_pad, bool down) {
+ 
+ void MnkInputDriver::QueueMouseCaptureUpdate(bool should_capture) {
+   mouse_capture_requested_.store(should_capture, std::memory_order_relaxed);
++  // Polling input is frequent. Only wake the UI when capture needs to change.
++  // Compare with applied state, not the previous request: if no window was
++  // available, a later poll must retry the outstanding request.
++  if (should_capture == mouse_capture_applied_.load(std::memory_order_relaxed)) {
++    return;
++  }
+   bool already_queued = false;
+   if (!mouse_capture_update_queued_.compare_exchange_strong(already_queued, true)) {
+     return;
+@@ -432,6 +438,7 @@ void MnkInputDriver::ApplyMouseCaptureFromUIThread() {
+   window->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
+   window->CaptureMouse();
+   relative_mouse_mode_ = window->SetRelativeMouseMode(true);
++  mouse_capture_applied_.store(true, std::memory_order_relaxed);
+   if (!relative_mouse_mode_) {
+     REXLOG_WARN("Pointer lock unavailable, mouse look falls back to recentering the cursor");
+   }
+@@ -450,6 +457,7 @@ void MnkInputDriver::ReleaseMouseCaptureFromUIThread(rex::ui::Window* window) {
+   window->SetRelativeMouseMode(false);
+   relative_mouse_mode_ = false;
+   window->ReleaseMouse();
++  mouse_capture_applied_.store(false, std::memory_order_relaxed);
+ }
+ 
+ void MnkInputDriver::RecenterCursorFromUIThread(int32_t x, int32_t y) {
 diff --git a/src/system/function_dispatcher.cpp b/src/system/function_dispatcher.cpp
 index bd43109..7c34df1 100644
 --- a/src/system/function_dispatcher.cpp
@@ -1384,6 +1703,33 @@ index bd43109..7c34df1 100644
  }
  
  PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 77bce25..1707cc2 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -894,12 +894,18 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
+     pcr.prcb_data.current_cpu = cpu_index;
+   }
+ 
++  // Guest CPU bookkeeping above is required even when the host scheduler
++  // chooses placement. In that mode there is no six-core host requirement.
++  if (REXCVAR_GET(ignore_thread_affinities)) {
++    return;
++  }
+   if (rex::thread::logical_processor_count() >= 6) {
+-    if (!REXCVAR_GET(ignore_thread_affinities)) {
+-      thread_->set_affinity_mask(uint64_t(1) << cpu_index);
+-    }
++    thread_->set_affinity_mask(uint64_t(1) << cpu_index);
+   } else {
+-    REXSYS_WARN("Too few processor cores - scheduling will be wonky");
++    static std::atomic_flag warned = ATOMIC_FLAG_INIT;
++    if (!warned.test_and_set(std::memory_order_relaxed)) {
++      REXSYS_WARN("Fewer than six logical processors; leaving host thread placement to the scheduler");
++    }
+   }
+ }
+ 
 diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
 index b94fe9e..8e5f781 100644
 --- a/src/ui/rex_app.cpp

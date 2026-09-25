@@ -14,8 +14,10 @@ on your own PC, from your own disc.
 ## Status
 
 Playable. The intro videos, character creator, missions and free roam all work,
-with sound, at the original 30 FPS. The game renders at 2x its original
-resolution by default.
+with sound. The game runs at its original 30 FPS, or at 60 and above with the
+bundled 60 FPS mod, and renders at 2x its original resolution by default.
+Keyboard and mouse are fully supported, and the on-screen button prompts switch
+between controller and keyboard pictures to match what you use.
 
 ### Known issues
 
@@ -67,15 +69,36 @@ troubleshooting.
 Run `dist\WhompaysModLoader.exe` to pick mods and play, or `dist\saintsrow.exe`
 to play directly.
 
-| Action | Control |
+An Xbox controller works as on the console. Keyboard and mouse controls follow
+Saints Row 2 on PC:
+
+| On foot | | In a vehicle | |
+|---|---|---|---|
+| Move | W A S D | Accelerate / brake | W / S |
+| Camera | Mouse | Steer | A / D |
+| Attack / secondary | Left / right mouse button | Drive-by | Left mouse button |
+| Jump / sprint | Space / Shift | Handbrake / nitrous | Space / Shift |
+| Action, enter vehicle | E | Exit vehicle | E |
+| Reload, pick up weapon | R | Look left / right / back | Z / C / X |
+| Kick / crouch | F / C | Hydraulics | Ctrl |
+
+Everywhere: hold Q for the weapon wheel (point with the mouse), Esc or M for
+the pause menu and map, Tab for back, the arrow keys for the D-pad, Enter and
+Backspace for A and B in menus. In the pause menu the mouse pans the map, the
+wheel zooms and the left button sets a waypoint; Q and E switch tabs. A mouse
+click skips cutscenes. When tagging, move the mouse in circles the way the
+arrows show.
+
+| Key | Effect |
 |---|---|
-| Toggle fullscreen / window | F11 |
-| Game controls | Xbox controller (XInput) |
-| Start, A, B | Enter, Space, Backspace |
-| Left stick | W A S D |
+| F11 | Fullscreen / window |
+| F10 | Frame rate cap: 30, 60, 90 or 120 (above 30 needs the 60 FPS mod) |
+| F1 | Frame rate counter |
 
 Input is ignored while the game window is not focused. Saves and profile data
-are stored in `dist\game`.
+are stored in `dist\game`. Setup makes the keyboard button pictures from your
+own game files (see [tools/glyphgen](tools/glyphgen/README.md)); if that step
+fails, the game shows controller buttons.
 
 Options, set by creating a file next to `saintsrow.exe`:
 
@@ -83,6 +106,10 @@ Options, set by creating a file next to `saintsrow.exe`:
 |---|---|
 | `res_scale.txt` | Internal resolution scale: `1` (720p), `2` (default) or `3`. |
 | `start_windowed` | Start in a window instead of fullscreen. The file can be empty. |
+| `mouse_sensitivity.txt` | Mouse sensitivity, `1.0` by default. |
+| `fps_cap.txt` | Frame rate cap. F10 writes it for you. |
+| `ram_cache_mb.txt` | Memory for caching reads from the game's packfiles, in MB (`0` turns it off). The default depends on your RAM. |
+| `gpu_queue.txt` | How many GPU command buffers may be queued, `1` by default. `0` waits for every buffer (slower, for troubleshooting). |
 
 ## Mods
 
@@ -103,6 +130,8 @@ input. This repository adds the Saints Row-specific parts:
 | `config/saintsrow_manifest.toml` | Recompiler configuration: ABI helpers, functions static analysis misses, mid-function hooks |
 | `project/src/stubs.cpp` | Game-specific replacements for recompiled functions and kernel calls |
 | `project/src/main.cpp` | Program entry: memory setup, window, runtime |
+| `project/src/kbm.cpp`, `project/src/glyphs.cpp` | Keyboard and mouse controls; controller / keyboard button prompts |
+| `tools/glyphgen` | Makes the keyboard button pictures from your game files during setup |
 | `project/src/wml`, `project/launcher` | Whompay's Mod Loader and its launcher |
 | `modding` | Mod API header, examples and documentation |
 | `patches/rexglue-sdk.patch` | Changes to the SDK that the game needs |

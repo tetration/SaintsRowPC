@@ -67,6 +67,7 @@ set(SAINTSROW_SOURCES
     src/fps_overlay.cpp
     src/perf_monitor.cpp
     src/kbm.cpp
+    src/glyphs.cpp
     src/profiler.cpp
     src/wml/mod_list.cpp
     src/wml/mod_loader.cpp
@@ -111,6 +112,8 @@ target_compile_options(saintsrow PRIVATE
 )
 if(NOT MSVC)
     target_compile_options(saintsrow PRIVATE -msse4.1)
+    # saintsrow.map lets the built-in profiler name functions.
+    target_link_options(saintsrow PRIVATE "LINKER:/MAP:saintsrow.map")
 endif()
 
 # /force:multiple lets stubs.cpp override the SDK's kernel export implementations.
@@ -143,3 +146,10 @@ target_include_directories(whompays_trainer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/
 target_link_libraries(whompays_trainer PRIVATE rex::runtime user32 gdi32)
 target_compile_options(whompays_trainer PRIVATE -msse4.1)
 set_target_properties(whompays_trainer PROPERTIES OUTPUT_NAME "WhompaysTrainer" PREFIX "")
+
+# Keyboard/mouse button pictures: setup runs glyphgen on the player's own game
+# files to make dist/kbm_ui.bin (see tools/glyphgen/README.md).
+add_executable(glyphgen ../tools/glyphgen/glyphgen.cpp src/wml/packfile.cpp)
+target_include_directories(glyphgen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/wml)
+target_compile_definitions(glyphgen PRIVATE _CRT_SECURE_NO_WARNINGS)
+target_link_libraries(glyphgen PRIVATE wml_zlib)

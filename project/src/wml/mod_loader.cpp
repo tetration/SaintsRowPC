@@ -3,6 +3,7 @@
 
 #include "mod_loader.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdarg>
@@ -11,6 +12,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <chrono>
 #include <unordered_map>
 #include <vector>
 
@@ -75,6 +77,9 @@ std::vector<FrameCallback> g_game_frame_callbacks;
 
 std::array<uint8_t, 256> g_keys_now{};
 std::array<uint8_t, 256> g_keys_prev{};
+// Keys some mod has asked about. GetAsyncKeyState is a system call; polling
+// all 255 keys every frame cost the game thread about a tenth of its time.
+std::array<std::atomic<uint8_t>, 256> g_keys_watched{};
 
 bool GameWindowFocused() {
 #ifdef _WIN32
@@ -92,6 +97,7 @@ void UpdateKeys() {
   g_keys_prev = g_keys_now;
   bool focused = GameWindowFocused();
   for (int vk = 1; vk < 256; ++vk) {
+    if (!g_keys_watched[vk].load(std::memory_order_relaxed)) continue;
 #ifdef _WIN32
     g_keys_now[vk] = focused && (GetAsyncKeyState(vk) & 0x8000) ? 1 : 0;
 #else
@@ -360,8 +366,53 @@ bool KeyForced(int vk) {
 }
 double TakeCameraTurn() { return g_camera_turn.exchange(0.0, std::memory_order_relaxed); }
 
-bool KeyDown(int vk) { return vk > 0 && vk < 256 && g_keys_now[vk]; }
-bool KeyPressed(int vk) { return vk > 0 && vk < 256 && g_keys_now[vk] && !g_keys_prev[vk]; }
+namespace {
+std::mutex g_look_mutex;
+double g_look_yaw = 0, g_look_pitch = 0;
+}
+void AddMouseLook(double yaw, double pitch) {
+  std::lock_guard<std::mutex> lock(g_look_mutex);
+  // Kept small in case no mod reads it.
+  g_look_yaw = std::clamp(g_look_yaw + yaw, -10.0, 10.0);
+  g_look_pitch = std::clamp(g_look_pitch + pitch, -10.0, 10.0);
+}
+void TakeMouseLook(double& yaw, double& pitch) {
+  std::lock_guard<std::mutex> lock(g_look_mutex);
+  yaw = g_look_yaw;
+  pitch = g_look_pitch;
+  g_look_yaw = g_look_pitch = 0;
+}
+
+// Camera turn limits set by a mod each frame (wml.limit_camera): the
+// current angles relative to what they are limited against, and the limits.
+namespace {
+std::mutex g_limit_mutex;
+CameraLimit g_limit;
+std::chrono::steady_clock::time_point g_limit_time{};
+}
+void SetCameraLimit(const CameraLimit& limit) {
+  std::lock_guard<std::mutex> lock(g_limit_mutex);
+  g_limit = limit;
+  g_limit_time = std::chrono::steady_clock::now();
+}
+bool GetCameraLimit(CameraLimit& limit) {
+  std::lock_guard<std::mutex> lock(g_limit_mutex);
+  if (!g_limit.active || std::chrono::steady_clock::now() - g_limit_time > std::chrono::milliseconds(200)) return false;
+  limit = g_limit;
+  return true;
+}
+
+// A key is polled from the frame after it is first asked about.
+bool KeyDown(int vk) {
+  if (vk <= 0 || vk >= 256) return false;
+  g_keys_watched[vk].store(1, std::memory_order_relaxed);
+  return g_keys_now[vk];
+}
+bool KeyPressed(int vk) {
+  if (vk <= 0 || vk >= 256) return false;
+  g_keys_watched[vk].store(1, std::memory_order_relaxed);
+  return g_keys_now[vk] && !g_keys_prev[vk];
+}
 
 namespace {
 using Reg = PPCRegister PPCContext::*;
@@ -404,6 +455,14 @@ void Initialize(const fs::path& exe_dir, const fs::path& game_dir,
   g_log_file.open(g_mods_dir / "wml.log", std::ios::trunc);
   Log("WML", "Whompay's Mod Loader");
 
+  // Built-in parts of the port (core folder next to the exe, e.g. the
+  // Saints Reborn logo): always on, loaded first, and not listed in the mod
+  // manager. Like mods, they only change the player's own game files while
+  // the game runs; no game files are shipped.
+  for (auto& mod : LoadMods(exe_dir / "core")) {
+    mod.enabled = true;
+    g_mods.push_back(std::move(mod));
+  }
   for (auto& mod : LoadMods(g_mods_dir)) {
     if (mod.enabled) g_mods.push_back(std::move(mod));
   }

@@ -225,8 +225,24 @@ try {
     }
     Copy-Item -Force -ErrorAction Stop (Join-Path $GameBuild "ExampleNative.dll") (Join-Path $ModsDir "ExampleNative")
     Copy-Item -Force -ErrorAction Stop (Join-Path $GameBuild "WhompaysTrainer.dll") (Join-Path $ModsDir "WhompaysTrainer")
+
+    # Built-in parts (the Saints Reborn logo): always on, not in the mod list.
+    $CoreDir = Join-Path $Dist "core"
+    foreach ($part in Get-ChildItem -Directory (Join-Path $Root "core")) {
+        $target = Join-Path $CoreDir $part.Name
+        New-Item -ItemType Directory -Force -Path $target | Out-Null
+        Copy-Item -Recurse -Force -ErrorAction Stop -Exclude "*.png","*.py" (Join-Path $part.FullName "*") $target
+    }
 } catch {
     Fail "Could not copy the game to dist ($($_.Exception.Message)). If Saints Row PC is running, close it and run setup again."
+}
+
+# Keyboard/mouse button pictures, made from your own game files (they contain
+# parts of the game's textures, so they are not part of the download).
+Step "Making the keyboard/mouse button pictures"
+& (Join-Path $GameBuild "glyphgen.exe") (Join-Path $GameDir "packfiles") (Join-Path $Root "tools\glyphgen\art.txt") (Join-Path $Dist "kbm_ui.bin")
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Warning: the keyboard/mouse button pictures could not be made; the game will show controller buttons." -ForegroundColor Yellow
 }
 
 Stop-Transcript | Out-Null
