@@ -58,16 +58,28 @@ end
 local TRAFFIC_DESPAWN_CHECK = 0x82412878
 local SEEN_DESPAWN_DISTANCE = 0x82089EE4   -- 140.0
 local OTHER_DESPAWN_DISTANCE = 0x82089EE0  -- 130.0
+-- Cars behind the camera are removed at a much shorter distance than cars in
+-- front of it (0x83AD2644 vs 0x83AD2640, both set up from the traffic
+-- radius). Turning around for a moment was enough to delete the cars you had
+-- just been looking at. With keep_cars_behind, cars behind you stay as long
+-- as they would in front of you.
+local FRONT_DESPAWN_DISTANCE = 0x83AD2640
+local BEHIND_DESPAWN_DISTANCE = 0x83AD2644
+local keep_behind = wml.setting("keep_cars_behind", true)
 local despawned = 0
-if traffic_distance > 0 and traffic_distance ~= 1 then
+local scale = (traffic_distance > 0) and traffic_distance or 1
+if scale ~= 1 or keep_behind then
   local seen = wml.read_f32(SEEN_DESPAWN_DISTANCE)
   local other = wml.read_f32(OTHER_DESPAWN_DISTANCE)
   wml.hook(TRAFFIC_DESPAWN_CHECK, function(ctx)
-    wml.write_f32(SEEN_DESPAWN_DISTANCE, seen * traffic_distance)
-    wml.write_f32(OTHER_DESPAWN_DISTANCE, other * traffic_distance)
+    local behind = wml.read_f32(BEHIND_DESPAWN_DISTANCE)
+    wml.write_f32(SEEN_DESPAWN_DISTANCE, seen * scale)
+    wml.write_f32(OTHER_DESPAWN_DISTANCE, other * scale)
+    if keep_behind then wml.write_f32(BEHIND_DESPAWN_DISTANCE, math.max(behind, wml.read_f32(FRONT_DESPAWN_DISTANCE))) end
     ctx:call_original()
     wml.write_f32(SEEN_DESPAWN_DISTANCE, seen)
     wml.write_f32(OTHER_DESPAWN_DISTANCE, other)
+    if keep_behind then wml.write_f32(BEHIND_DESPAWN_DISTANCE, behind) end
     if (ctx:r(3) & 0xFF) ~= 0 then despawned = despawned + 1 end
   end)
 end
@@ -169,20 +181,10 @@ if debug then
     wml.read_f32(0x8208978C), wml.read_f32(0x82089998)))
   wml.log(string.format("Traffic radius %.1f -> %.1f", radius, wml.read_f32(TRAFFIC_RADIUS)))
 
-  -- Pedestrian placement distances (read by the ped spawner, 0x8240E538).
-  local logged = 0
-  wml.hook(0x826306A8, function(ctx)
-    ctx:call_original()
-    if logged < 3 and ctx:lr() == 0x8240E570 then
-      logged = logged + 1
-      local p = ctx:r(3) & 0xFFFFFFFF
-      local t = {}
-      for i = 0, 7 do t[#t + 1] = string.format("%.2f", wml.read_f32(p + 5304 + i * 4)) end
-      for i = 14, 17 do t[#t + 1] = string.format("%.2f", wml.read_f32(p + 5304 + i * 4)) end
-      wml.log("Ped placement values: " .. table.concat(t, " ") ..
-        string.format("  ped radius const %.2f", wml.read_f32(0x820897A8)))
-    end
-  end)
+  -- Pedestrian placement distance (read by the ped spawner, 0x8240E538).
+  -- (This used to hook a helper the whole game calls constantly just to log
+  -- it; that cost frame rate on every thread even after logging stopped.)
+  wml.log(string.format("Ped radius const %.2f", wml.read_f32(0x820897A8)))
 end
 
 if debug then
@@ -224,5 +226,84 @@ if debug then
     trims = 0
     despawned = 0
     same_model_max = 0
+  end)
+end
+
+-- Detail distance: the game's own tuning values for how far away car parts
+-- are drawn, street lights fade and trees switch to their simple versions.
+-- They are set once the game has filled them in.
+local detail = wml.setting("detail_distance", 2.0)
+if detail > 0 and detail ~= 1 then
+  local tuning = {
+    { 0x827AC0C8, detail },       -- vehicle_component_cull_distance
+    { 0x827AC0C4, 1 / detail },   -- vehicle component cull size
+    -- level_lights_fade_dist_cap (0x827AD184) is left alone: raising it
+    -- draws light pools on roads far away with broken, rainbow colours.
+    { 0x827AC480, detail },       -- Tree_lod_scale
+  }
+  local applied = false
+  wml.on_frame(function()
+    if applied then return end
+    for _, t in ipairs(tuning) do
+      if not (wml.read_f32(t[1]) > 0) then return end
+    end
+    for _, t in ipairs(tuning) do
+      wml.write_f32(t[1], wml.read_f32(t[1]) * t[2])
+    end
+    applied = true
+  end)
+end
+
+-- Car draw distance: every car model has four detail distances in the vehicle
+-- table; past the last one the car is not drawn at all.
+local VEHICLE_INFO, VEHICLE_INFO_SIZE, VEHICLE_INFO_COUNT = 0x83E8ABD8, 1196, 0x8371023C
+local LAST_LOD = 280
+local car_draw = wml.setting("car_draw_distance", 600)
+if car_draw > 0 then
+  local frames = 0
+  wml.on_frame(function()
+    frames = frames + 1
+    if frames % 120 ~= 1 then return end
+    local count = to_int(wml.read_u32(VEHICLE_INFO_COUNT))
+    if count <= 0 or count > 256 then return end
+    for i = 0, count - 1 do
+      local a = VEHICLE_INFO + i * VEHICLE_INFO_SIZE + LAST_LOD
+      local d = wml.read_f32(a)
+      if d > 0 and d < car_draw and d > wml.read_f32(a - 4) then wml.write_f32(a, car_draw) end
+    end
+  end)
+end
+
+-- Traffic spacing: the spawner picks one of the free road spots near the edge
+-- of the traffic area at random (up to 3 tries). A spot too close to another
+-- traffic car is refused, so the next try lands somewhere else.
+local SPAWN_AT_SPOT = 0x82411310
+local SPAWNER_SPAWN_CALL = 0x82412FF8
+local TRAFFIC_LIST = 0x8309A374      -- first node; node+0 next, node+8 handle
+local OBJECT_TABLE = 0x830866C8
+local spacing = wml.setting("traffic_spacing", 30)
+if spacing > 0 then
+  local min2 = spacing * spacing
+  wml.hook(SPAWN_AT_SPOT, function(ctx)
+    if ctx:lr() == SPAWNER_SPAWN_CALL then
+      local spot = ctx:r(3)
+      local sx, sz = wml.read_f32(spot), wml.read_f32(spot + 8)
+      local node = wml.read_u32(TRAFFIC_LIST)
+      local guard = 0
+      while node ~= 0 and guard < 64 do
+        guard = guard + 1
+        local handle = wml.read_u32(node + 8)
+        local obj = wml.read_u32(OBJECT_TABLE + 12 + (handle & 0xFFFF) * 16)
+        if obj ~= 0 and (handle & 0xFFFF) < 4096 and wml.read_u32(obj + 68) == handle then
+          local dx, dz = wml.read_f32(obj + 20) - sx, wml.read_f32(obj + 28) - sz
+          if dx * dx + dz * dz < min2 then
+            ctx:set_r(3, 0)
+            return
+          end
+        end
+        node = wml.read_u32(node)
+      end
+    end
+    ctx:call_original()
   end)
 end

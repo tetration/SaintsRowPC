@@ -4,7 +4,7 @@
 // them on and off and change their load order, saves mods/modlist.ini and
 // starts saintsrow.exe.
 //
-// Part of Saints Row PC (MIT License).
+// Part of Saints Reborn (MIT License).
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -278,7 +278,7 @@ HWND MakeControl(const wchar_t* cls, const wchar_t* text, DWORD style, int id, H
 void CreateControls() {
   g_app.title = MakeControl(L"STATIC", kTitle, SS_LEFT, 0, g_app.title_font);
   g_app.subtitle = MakeControl(
-      L"STATIC", L"Saints Row PC  ·  tick the mods you want, then press Play.", SS_LEFT, 0,
+      L"STATIC", L"Saints Reborn  ·  tick the mods you want, then press Play.", SS_LEFT, 0,
       g_app.font);
 
   g_app.list = MakeControl(WC_LISTVIEWW, L"",

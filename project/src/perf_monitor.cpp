@@ -23,6 +23,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <psapi.h>
 #include <tlhelp32.h>
 #endif
 
@@ -101,6 +102,10 @@ std::unordered_map<DWORD, ThreadSample> SampleThreads() {
 void MonitorLoop() {
 #ifdef _WIN32
   auto prev_threads = SampleThreads();
+  PROCESS_MEMORY_COUNTERS_EX previous_memory{};
+  bool have_previous_memory = K32GetProcessMemoryInfo(
+      GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&previous_memory),
+      sizeof(previous_memory)) != FALSE;
 #endif
   auto prev_time = Clock::now();
   while (g_running.load()) {
@@ -162,7 +167,10 @@ void MonitorLoop() {
     double total = 0;
     for (const auto& [tid, sample] : threads) {
       auto it = prev_threads.find(tid);
-      uint64_t before = it != prev_threads.end() ? it->second.cpu_100ns : 0;
+      // A newly observed thread has no interval baseline. Its lifetime CPU
+      // total (or that of a recycled thread ID) is not this sample's CPU use.
+      if (it == prev_threads.end() || sample.cpu_100ns < it->second.cpu_100ns) continue;
+      uint64_t before = it->second.cpu_100ns;
       double pct = double(sample.cpu_100ns - before) / (wall_s * 1e7) * 100.0;
       total += pct;
       if (pct >= 3.0) busy.push_back({pct, tid, &sample.name});
@@ -178,6 +186,32 @@ void MonitorLoop() {
       text += part;
     }
     prev_threads = std::move(threads);
+    PROCESS_MEMORY_COUNTERS_EX memory{};
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(),
+                               reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory),
+                               sizeof(memory))) {
+      constexpr double kMiB = 1024.0 * 1024.0;
+      std::snprintf(part, sizeof(part), " | memory working set %.0f MiB private commit %.0f MiB",
+                    memory.WorkingSetSize / kMiB, memory.PrivateUsage / kMiB);
+      text += part;
+      if (have_previous_memory) {
+        // Includes soft faults; this is not a count of disk reads or hard faults.
+        const DWORD faults = memory.PageFaultCount - previous_memory.PageFaultCount;
+        std::snprintf(part, sizeof(part), " faults %.0f/s", faults / wall_s);
+        text += part;
+      }
+      previous_memory = memory;
+      have_previous_memory = true;
+    } else {
+      have_previous_memory = false;
+    }
+    MEMORYSTATUSEX system_memory{};
+    system_memory.dwLength = sizeof(system_memory);
+    if (GlobalMemoryStatusEx(&system_memory)) {
+      std::snprintf(part, sizeof(part), " | system available %.0f MiB",
+                    system_memory.ullAvailPhys / (1024.0 * 1024.0));
+      text += part;
+    }
 #endif
     REXLOG_INFO("{}", text);
   }
@@ -193,6 +227,8 @@ void StartPerfMonitor() {
   g_running = true;
   g_thread = std::thread(MonitorLoop);
   REXLOG_INFO("Performance log enabled");
+  REXLOG_INFO("Host logical processors: {} | CPU percentages use one logical processor as 100%",
+              std::thread::hardware_concurrency());
 }
 
 void StopPerfMonitor() {
@@ -265,11 +301,19 @@ void LimitFrameRate(double fps) {
     auto remaining = next - now;
     // Sleep most of the way, then spin for the last half millisecond.
     auto sleep_for = remaining - microseconds(500);
-    if (timer && sleep_for > microseconds(0)) {
-      LARGE_INTEGER due;
-      due.QuadPart = -int64_t(duration_cast<nanoseconds>(sleep_for).count() / 100);
-      if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
-        WaitForSingleObject(timer, INFINITE);
+    if (sleep_for > microseconds(0)) {
+      bool slept = false;
+      if (timer) {
+        LARGE_INTEGER due;
+        due.QuadPart = -int64_t(duration_cast<nanoseconds>(sleep_for).count() / 100);
+        if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+          slept = WaitForSingleObject(timer, INFINITE) == WAIT_OBJECT_0;
+        }
+      }
+      // Older Windows versions may reject the high-resolution timer flag.
+      // Do not turn the entire remaining frame budget into a busy wait.
+      if (!slept) {
+        std::this_thread::sleep_until(next - microseconds(500));
       }
     }
 #else

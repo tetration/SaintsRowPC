@@ -1,4 +1,4 @@
-# Saints Row PC - build script.
+# Saints Reborn - build script.
 #
 # Builds a native Windows version of Saints Row (Xbox 360, 2006) from YOUR OWN
 # copy of the game. Nothing from the game is included in this repository; the
@@ -200,7 +200,7 @@ if (-not (Done "codegen" $codegenKey)) {
 # ---------------------------------------------------------------------------
 # 5. Build saintsrow.exe
 # ---------------------------------------------------------------------------
-Step "Building Saints Row PC (compiles ~34,000 functions; expect 15-60 minutes)"
+Step "Building Saints Reborn (compiles ~34,000 functions; expect 15-60 minutes)"
 $env:REXSDK = $SdkInstall
 Run "cmake" @("-S", (Join-Path $Root "project"), "-B", $GameBuild, "-G", "Ninja",
     "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_C_COMPILER=clang", "-DCMAKE_CXX_COMPILER=clang++",
@@ -225,8 +225,24 @@ try {
     }
     Copy-Item -Force -ErrorAction Stop (Join-Path $GameBuild "ExampleNative.dll") (Join-Path $ModsDir "ExampleNative")
     Copy-Item -Force -ErrorAction Stop (Join-Path $GameBuild "WhompaysTrainer.dll") (Join-Path $ModsDir "WhompaysTrainer")
+
+    # Built-in parts (the Saints Reborn logo): always on, not in the mod list.
+    $CoreDir = Join-Path $Dist "core"
+    foreach ($part in Get-ChildItem -Directory (Join-Path $Root "core")) {
+        $target = Join-Path $CoreDir $part.Name
+        New-Item -ItemType Directory -Force -Path $target | Out-Null
+        Copy-Item -Recurse -Force -ErrorAction Stop -Exclude "*.png","*.py" (Join-Path $part.FullName "*") $target
+    }
 } catch {
-    Fail "Could not copy the game to dist ($($_.Exception.Message)). If Saints Row PC is running, close it and run setup again."
+    Fail "Could not copy the game to dist ($($_.Exception.Message)). If Saints Reborn is running, close it and run setup again."
+}
+
+# Keyboard/mouse button pictures, made from your own game files (they contain
+# parts of the game's textures, so they are not part of the download).
+Step "Making the keyboard/mouse button pictures"
+& (Join-Path $GameBuild "glyphgen.exe") (Join-Path $GameDir "packfiles") (Join-Path $Root "tools\glyphgen\art.txt") (Join-Path $Dist "kbm_ui.bin")
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Warning: the keyboard/mouse button pictures could not be made; the game will show controller buttons." -ForegroundColor Yellow
 }
 
 Stop-Transcript | Out-Null

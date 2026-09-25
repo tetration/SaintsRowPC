@@ -1,5 +1,5 @@
-// Saints Row PC Setup
-// Builds Saints Row PC on the player's machine from their own Xbox 360 disc image.
+// Saints Reborn Setup
+// Builds Saints Reborn on the player's machine from their own Xbox 360 disc image.
 // It installs the build tools it needs (Git, Visual Studio 2022 Build Tools with
 // the C++ and Clang components, the Visual C++ runtime), downloads the source
 // code from GitHub and runs scripts\setup.ps1. No game code is included.
@@ -18,19 +18,19 @@ using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-[assembly: AssemblyTitle("Saints Row PC Setup")]
-[assembly: AssemblyProduct("Saints Row PC")]
+[assembly: AssemblyTitle("Saints Reborn Setup")]
+[assembly: AssemblyProduct("Saints Reborn")]
 [assembly: AssemblyCompany("whompay")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
 
-namespace SaintsRowPCSetup
+namespace SaintsRebornSetup
 {
     static class Config
     {
-        public const string Version = "1.0.0";
-        public const string RepoUrl = "https://github.com/whompay/SaintsRowPC.git";
-        public const string RepoPage = "https://github.com/whompay/SaintsRowPC";
+        public const string Version = "1.1.0";
+        public const string RepoUrl = "https://github.com/whompay/SaintsReborn.git";
+        public const string RepoPage = "https://github.com/whompay/SaintsReborn";
         public const string Branch = "main";
         public const string MinGitUrl =
             "https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.1/MinGit-2.47.1-64-bit.zip";
@@ -83,7 +83,7 @@ namespace SaintsRowPCSetup
 
         public SetupForm(bool update)
         {
-            Text = "Saints Row PC Setup " + Config.Version;
+            Text = "Saints Reborn Setup " + Config.Version;
             AutoScaleMode = AutoScaleMode.Dpi;
             ClientSize = new Size(720, 568);
             MinimumSize = new Size(620, 460);
@@ -92,7 +92,7 @@ namespace SaintsRowPCSetup
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
             var title = new Label {
-                Text = "Saints Row PC", Font = new Font("Segoe UI", 16F, FontStyle.Bold),
+                Text = "Saints Reborn", Font = new Font("Segoe UI", 16F, FontStyle.Bold),
                 AutoSize = true, Location = new Point(16, 12)
             };
             var intro = new Label {
@@ -118,8 +118,8 @@ namespace SaintsRowPCSetup
             dirBox = new TextBox { Location = new Point(18, 204), Width = 580, Text = DefaultInstallDir(), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
             dirBrowse = new Button { Text = "Browse...", Location = new Point(606, 202), Width = 96, Anchor = AnchorStyles.Top | AnchorStyles.Right };
             dirBrowse.Click += delegate {
-                using (var d = new FolderBrowserDialog { Description = "Choose the Saints Row PC folder", ShowNewFolderButton = true })
-                    if (d.ShowDialog(this) == DialogResult.OK) dirBox.Text = Updating || IsInstallFolder(d.SelectedPath) ? d.SelectedPath : Path.Combine(d.SelectedPath, "SaintsRowPC");
+                using (var d = new FolderBrowserDialog { Description = "Choose the Saints Reborn folder", ShowNewFolderButton = true })
+                    if (d.ShowDialog(this) == DialogResult.OK) dirBox.Text = Updating || IsInstallFolder(d.SelectedPath) ? d.SelectedPath : Path.Combine(d.SelectedPath, "SaintsReborn");
             };
 
             desktopShortcut = new CheckBox { Text = "Create a desktop shortcut", Checked = true, AutoSize = true, Location = new Point(18, 236) };
@@ -157,16 +157,16 @@ namespace SaintsRowPCSetup
         {
             if (Updating)
             {
-                Text = "Saints Row PC Updater " + Config.Version;
+                Text = "Saints Reborn Updater " + Config.Version;
                 isoLabel.Text = "Saints Row disc image (.iso) - only needed if the game files are missing:";
-                dirLabel.Text = "Your Saints Row PC folder (the one with setup.bat and the dist folder):";
+                dirLabel.Text = "Your Saints Reborn folder (the one with setup.bat and the dist folder):";
                 installBtn.Text = "Update";
                 string known = KnownInstallDir();
                 if (known != null) dirBox.Text = known;
             }
             else
             {
-                Text = "Saints Row PC Setup " + Config.Version;
+                Text = "Saints Reborn Setup " + Config.Version;
                 isoLabel.Text = "Saints Row disc image (.iso):";
                 dirLabel.Text = "Install folder (a short path without spaces works best):";
                 installBtn.Text = "Install";
@@ -180,11 +180,13 @@ namespace SaintsRowPCSetup
         {
             try
             {
-                using (var k = Registry.CurrentUser.OpenSubKey(@"Software\SaintsRowPC"))
-                {
-                    string d = k == null ? null : k.GetValue("InstallDir") as string;
-                    if (d != null && IsInstallFolder(d)) return d;
-                }
+                // The old name's key is still read, for installs made before the rename.
+                foreach (string key in new[] { @"Software\SaintsReborn", @"Software\SaintsRowPC" })
+                    using (var k = Registry.CurrentUser.OpenSubKey(key))
+                    {
+                        string d = k == null ? null : k.GetValue("InstallDir") as string;
+                        if (d != null && IsInstallFolder(d)) return d;
+                    }
             }
             catch { }
             string here = Path.GetDirectoryName(Application.ExecutablePath);
@@ -202,14 +204,14 @@ namespace SaintsRowPCSetup
 
         static void RememberInstallDir(string dir)
         {
-            try { using (var k = Registry.CurrentUser.CreateSubKey(@"Software\SaintsRowPC")) k.SetValue("InstallDir", dir); } catch { }
+            try { using (var k = Registry.CurrentUser.CreateSubKey(@"Software\SaintsReborn")) k.SetValue("InstallDir", dir); } catch { }
         }
 
         static string DefaultInstallDir()
         {
             string drive = Path.GetPathRoot(Environment.GetFolderPath(Environment.SpecialFolder.Windows));
             if (string.IsNullOrEmpty(drive)) drive = @"C:\";
-            return Path.Combine(drive, @"Games\SaintsRowPC");
+            return Path.Combine(drive, @"Games\SaintsReborn");
         }
 
         // ------------------------------------------------------------------ UI helpers
@@ -269,21 +271,21 @@ namespace SaintsRowPCSetup
                     (name.Equals("dist", StringComparison.OrdinalIgnoreCase) || name.Equals("scripts", StringComparison.OrdinalIgnoreCase)))
                 { dir = parent; dirBox.Text = dir; }
                 if (!IsInstallFolder(dir))
-                { MessageBox.Show(this, "That folder is not a Saints Row PC folder. Choose the folder that contains setup.bat and the dist folder.", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+                { MessageBox.Show(this, "That folder is not a Saints Reborn folder. Choose the folder that contains setup.bat and the dist folder.", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
             }
             else if (IsInstallFolder(dir))
             {
-                if (MessageBox.Show(this, "Saints Row PC is already in that folder. Update it instead?", Text,
+                if (MessageBox.Show(this, "Saints Reborn is already in that folder. Update it instead?", Text,
                         MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
                 updateMode.Checked = true;
             }
             if (Process.GetProcessesByName("saintsrow").Length > 0 || Process.GetProcessesByName("WhompaysModLoader").Length > 0)
-            { MessageBox.Show(this, "Close Saints Row PC and the mod loader first.", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+            { MessageBox.Show(this, "Close Saints Reborn and the mod loader first.", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
             bool gameExtracted = File.Exists(Path.Combine(dir, @"dist\game\default.xex"));
             if (!gameExtracted && (iso.Length == 0 || !File.Exists(iso)))
             { MessageBox.Show(this, "Select your Saints Row disc image (.iso) first.", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
             if (dir.Length < 4 || !Path.IsPathRooted(dir))
-            { MessageBox.Show(this, "Choose a full install folder path, for example C:\\Games\\SaintsRowPC.", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+            { MessageBox.Show(this, "Choose a full install folder path, for example C:\\Games\\SaintsReborn.", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
             if (dir.Length > 60 &&
                 MessageBox.Show(this, "The install folder path is long, which can make the build fail. Continue anyway?", Text,
                     MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
@@ -318,7 +320,7 @@ namespace SaintsRowPCSetup
             {
                 Directory.CreateDirectory(dir);
                 lock (logLock) logFile = new StreamWriter(Path.Combine(dir, "setup-installer.log"), true);
-                Log("Saints Row PC Setup " + Config.Version + " - " + DateTime.Now);
+                Log("Saints Reborn Setup " + Config.Version + " - " + DateTime.Now);
                 Log("Install folder: " + dir);
 
                 EnsureGit();
@@ -330,7 +332,7 @@ namespace SaintsRowPCSetup
                 {
                     DialogResult r = DialogResult.No;
                     Invoke((Action)delegate {
-                        r = MessageBox.Show(this, "Saints Row PC is already up to date. Rebuild it anyway?", Text,
+                        r = MessageBox.Show(this, "Saints Reborn is already up to date. Rebuild it anyway?", Text,
                             MessageBoxButtons.YesNo, MessageBoxIcon.Question);
                     });
                     if (r != DialogResult.Yes)
@@ -348,11 +350,11 @@ namespace SaintsRowPCSetup
                 RememberInstallDir(dir);
 
                 Progress(100);
-                Status(changed && IsUpdate ? "Done! Saints Row PC is updated." : "Done! Saints Row PC is installed.");
+                Status(changed && IsUpdate ? "Done! Saints Reborn is updated." : "Done! Saints Reborn is installed.");
                 Log("Run " + Path.Combine(dir, @"dist\WhompaysModLoader.exe") + " to choose mods and play.");
                 Ui(delegate {
                     playBtn.Visible = true;
-                    MessageBox.Show(this, "Saints Row PC is ready. Press Play, or use the Saints Row PC shortcut.", Text,
+                    MessageBox.Show(this, "Saints Reborn is ready. Press Play, or use the Saints Reborn shortcut.", Text,
                         MessageBoxButtons.OK, MessageBoxIcon.Information);
                 });
             }
@@ -409,7 +411,7 @@ namespace SaintsRowPCSetup
             if (found == null)
             {
                 Status("Downloading Git");
-                string zip = Path.Combine(Path.GetTempPath(), "SaintsRowPC-MinGit.zip");
+                string zip = Path.Combine(Path.GetTempPath(), "SaintsReborn-MinGit.zip");
                 Download(Config.MinGitUrl, zip);
                 if (Directory.Exists(local)) Directory.Delete(local, true);
                 ZipFile.ExtractToDirectory(zip, local);
@@ -423,7 +425,7 @@ namespace SaintsRowPCSetup
 
         static string ToolsDir()
         {
-            string d = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"SaintsRowPC\tools");
+            string d = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"SaintsReborn\tools");
             Directory.CreateDirectory(d);
             return d;
         }
@@ -456,7 +458,7 @@ namespace SaintsRowPCSetup
             string vs = FindCompleteVs();
             if (vs != null) return vs;
 
-            string bootstrapper = Path.Combine(Path.GetTempPath(), "SaintsRowPC-vs_BuildTools.exe");
+            string bootstrapper = Path.Combine(Path.GetTempPath(), "SaintsReborn-vs_BuildTools.exe");
             Status("Downloading the Visual Studio C++ build tools");
             Download(Config.BuildToolsUrl, bootstrapper);
 
@@ -493,7 +495,7 @@ namespace SaintsRowPCSetup
         {
             Status("Checking the Visual C++ runtime");
             if (VcRuntimeInstalled()) { Log("Visual C++ runtime: installed"); return; }
-            string exe = Path.Combine(Path.GetTempPath(), "SaintsRowPC-vc_redist.x64.exe");
+            string exe = Path.Combine(Path.GetTempPath(), "SaintsReborn-vc_redist.x64.exe");
             Status("Downloading the Visual C++ runtime");
             Download(Config.VcRedistUrl, exe);
             Status("Installing the Visual C++ runtime");
@@ -531,7 +533,7 @@ namespace SaintsRowPCSetup
             {
                 // Existing install: a git clone, or a zip download from GitHub. Bring it to the
                 // latest version; the build folder and dist (game files, mod settings) are kept.
-                Status("Downloading the latest Saints Row PC patches");
+                Status("Downloading the latest Saints Reborn patches");
                 Progress(-1);
                 bool isRepo = Directory.Exists(Path.Combine(dir, ".git"));
                 string before = isRepo ? (RunCapture(git, "-C \"" + dir + "\" rev-parse HEAD") ?? "").Trim() : "";
@@ -550,7 +552,7 @@ namespace SaintsRowPCSetup
                 Log("Updated " + (before.Length > 0 ? Short(before) : "download") + " -> " + Short(after));
                 return true;
             }
-            Status("Downloading the Saints Row PC source code");
+            Status("Downloading the Saints Reborn source code");
             Progress(-1);
             string tmp = Path.Combine(dir, ".download");
             if (Directory.Exists(tmp)) ForceDelete(tmp);
@@ -574,7 +576,7 @@ namespace SaintsRowPCSetup
 
         void BuildGame(string dir, string iso)
         {
-            Status("Building Saints Row PC (30-90 minutes)");
+            Status("Building Saints Reborn (30-90 minutes)");
             Progress(-1);
             string script = Path.Combine(dir, @"scripts\setup.ps1");
             if (!File.Exists(script)) throw new StepFailed("scripts\\setup.ps1 is missing from the source code download.");
@@ -608,15 +610,21 @@ namespace SaintsRowPCSetup
             if (!File.Exists(target)) target = Path.Combine(dist, "saintsrow.exe");
             try
             {
-                string menu = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), "Saints Row PC");
+                // Shortcuts from before the rename (Saints Reborn) are replaced.
+                string oldMenu = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), "Saints Row PC");
+                try { if (Directory.Exists(oldMenu)) Directory.Delete(oldMenu, true); } catch { }
+                string oldDesktop = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "Saints Row PC.lnk");
+                if (File.Exists(oldDesktop)) { desktop = true; try { File.Delete(oldDesktop); } catch { } }
+                try { File.Delete(Path.Combine(dir, "SaintsRowPC-Setup.exe")); } catch { }
+                string menu = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), "Saints Reborn");
                 Directory.CreateDirectory(menu);
-                MakeShortcut(Path.Combine(menu, "Saints Row PC.lnk"), target, dist, "Play Saints Row PC");
-                MakeShortcut(Path.Combine(menu, "Saints Row PC (no mod menu).lnk"), Path.Combine(dist, "saintsrow.exe"), dist, "Play Saints Row PC without the mod loader");
-                string setupCopy = Path.Combine(dir, "SaintsRowPC-Setup.exe");
+                MakeShortcut(Path.Combine(menu, "Saints Reborn.lnk"), target, dist, "Play Saints Reborn");
+                MakeShortcut(Path.Combine(menu, "Saints Reborn (no mod menu).lnk"), Path.Combine(dist, "saintsrow.exe"), dist, "Play Saints Reborn without the mod loader");
+                string setupCopy = Path.Combine(dir, "SaintsReborn-Setup.exe");
                 try { if (!string.Equals(Application.ExecutablePath, setupCopy, StringComparison.OrdinalIgnoreCase)) File.Copy(Application.ExecutablePath, setupCopy, true); } catch { }
-                if (File.Exists(setupCopy)) MakeShortcut(Path.Combine(menu, "Update Saints Row PC.lnk"), setupCopy, dir, "Get the latest Saints Row PC patches and mods", "/update");
+                if (File.Exists(setupCopy)) MakeShortcut(Path.Combine(menu, "Update Saints Reborn.lnk"), setupCopy, dir, "Get the latest Saints Reborn patches and mods", "/update");
                 if (desktop)
-                    MakeShortcut(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "Saints Row PC.lnk"), target, dist, "Play Saints Row PC");
+                    MakeShortcut(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "Saints Reborn.lnk"), target, dist, "Play Saints Reborn");
             }
             catch (Exception ex) { Log("Could not create shortcuts: " + ex.Message); }
         }
@@ -654,7 +662,7 @@ namespace SaintsRowPCSetup
                 try
                 {
                     var req = (HttpWebRequest)WebRequest.Create(url);
-                    req.UserAgent = "SaintsRowPC-Setup/" + Config.Version;
+                    req.UserAgent = "SaintsReborn-Setup/" + Config.Version;
                     req.AllowAutoRedirect = true;
                     req.Timeout = 60000;
                     req.ReadWriteTimeout = 60000;

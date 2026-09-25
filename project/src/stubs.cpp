@@ -26,6 +26,9 @@
 #include <thread>
 #include <unordered_map>
 
+#include <windows.h>
+#include <tlhelp32.h>
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -98,7 +101,48 @@ PPC_FUNC(sub_825E54A8) {
     }
     // The game is held to 60 frames per second at most (it normally caps
     // itself at 30; mods can raise that).
-    sr::LimitFrameRate(double(sr::g_fps_cap.load(std::memory_order_relaxed)));
+    // In the background, with a second copy on the same PC, run at 30 at
+    // most, so two copies don't fight over the GPU and stall each other.
+    {
+        static uint32_t focus_check = 0;
+        static bool background = false;
+        if ((focus_check++ & 15) == 0) {
+            HWND fg = GetForegroundWindow();
+            DWORD pid = 0;
+            if (fg) GetWindowThreadProcessId(fg, &pid);
+            const bool now_background = pid != GetCurrentProcessId();
+            if (now_background != background) {
+                // Windows favours the focused window's GPU work, which starves
+                // a second copy running side by side. Raise this process's GPU
+                // scheduling class while it is in the background.
+                using SetGpuClass = LONG(WINAPI*)(HANDLE, int);
+                static SetGpuClass set_gpu_class = reinterpret_cast<SetGpuClass>(
+                    GetProcAddress(GetModuleHandleW(L"gdi32.dll"), "D3DKMTSetProcessSchedulingPriorityClass"));
+                if (set_gpu_class) set_gpu_class(GetCurrentProcess(), now_background ? 3 : 2); // above normal / normal
+            }
+            background = now_background;
+        }
+        int cap = sr::g_fps_cap.load(std::memory_order_relaxed);
+        // Only when another copy runs on this PC: in a real co-op session the
+        // host tabbing out slowed its whole world (frame times past the
+        // game's own step limit), and the other player's copies of its people
+        // and cars tried to keep walking and jittered.
+        static bool other_copy = false;
+        if ((focus_check & 511) == 1) {
+            int copies = 0;
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (snap != INVALID_HANDLE_VALUE) {
+                PROCESSENTRY32W pe{};
+                pe.dwSize = sizeof(pe);
+                for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe))
+                    if (_wcsicmp(pe.szExeFile, L"saintsrow.exe") == 0) ++copies;
+                CloseHandle(snap);
+            }
+            other_copy = copies >= 2;
+        }
+        if (background && other_copy && cap > 30) cap = 30;
+        sr::LimitFrameRate(double(cap));
+    }
     sr::g_game_frames.fetch_add(1, std::memory_order_relaxed);
     sr::PerfFrameBegin();
     wml::OnFrame();
@@ -643,28 +687,26 @@ PPC_FUNC(sub_82789084) {
 // Streaming / loading
 // ============================================================================
 
-// Streaming work finder. Some callers pass a small sentinel value (e.g.
+// Builds a filtered copy of the streaming list. Some callers pass a small sentinel value (e.g.
 // 0x0000000F, 0x04000000) instead of a pointer, which the real function
 // dereferences and hangs on: return 0 for anything below 0x10000000.
-// Callers poll this in a tight loop, so after the first 50 calls on either
-// path each call sleeps 1 ms to leave CPU time for other threads.
+// Throttle only the invalid-input path. Valid calls allocate and copy a list;
+// sleeping on every call adds latency even when useful work is available.
 extern "C" void __imp__sub_8265F4F0(PPCContext& ctx, uint8_t* base);
 PPC_FUNC(sub_8265F4F0) {
     const uint32_t filter = ctx.r3.u32;
     if (filter != 0 && filter < 0x10000000u) {
         ctx.r3.u64 = 0;
-        static std::atomic<long long> rejected_calls{0};
-        if (++rejected_calls > 50) {
+        static thread_local uint32_t rejected_calls = 0;
+        if (rejected_calls < 50) {
+            ++rejected_calls;
+        } else {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         return;
     }
 
     __imp__sub_8265F4F0(ctx, base);
-    static std::atomic<long long> calls{0};
-    if (++calls > 50) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
 }
 
 // "Is this object finished?" check used by the post-"Begin Game" loader loop.
@@ -791,3 +833,14 @@ bool SrSkipNullVoiceDispatch(PPCRegister& r28) {
 void SrClampByteR10(PPCRegister& r10) { r10.u64 &= 0xFFu; }
 void SrClampByteR7(PPCRegister& r7) { r7.u64 &= 0xFFu; }
 void SrClampByteR8(PPCRegister& r8) { r8.u64 &= 0xFFu; }
+
+// Guest CRT memset(dst = r3, byte = r4, len = r5) and memcpy(dst = r3, src = r4,
+// len = r5). Both are hot; run them natively. r3 stays dst, as in the originals.
+PPC_FUNC(sub_82702DD0) {
+    if (ctx.r5.u32)
+        std::memset(GuestPtr(base, ctx.r3.u32), int(ctx.r4.u32 & 0xFF), ctx.r5.u32);
+}
+PPC_FUNC(sub_82702900) {
+    if (ctx.r5.u32 && ctx.r3.u32 != ctx.r4.u32)
+        std::memmove(GuestPtr(base, ctx.r3.u32), GuestPtr(base, ctx.r4.u32), ctx.r5.u32);
+}

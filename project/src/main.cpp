@@ -436,10 +436,13 @@ public:
             e.set_handled(true);
         }
     }
+    void OnMouseWheel(rex::ui::MouseEvent& e) override {
+        sr::AddMouseWheel(e.scroll_y());
+    }
     // The cursor is hidden while the game has focus (the mouse moves the camera).
     void OnGotFocus(rex::ui::UISetupEvent& e) override {
         (void)e;
-        if (window_) window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
+        if (window_ && !display_dialog_) window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
     }
     void OnLostFocus(rex::ui::UISetupEvent& e) override {
         (void)e;
@@ -506,7 +509,7 @@ public:
 
         // The window must exist before runtime_->Setup() so the GPU plugin can
         // build a presenting swapchain rather than a headless provider.
-        window_ = rex::ui::Window::Create(app_context(), "Saints Row PC", 1280, 720);
+        window_ = rex::ui::Window::Create(app_context(), "Saints Reborn", 1280, 720);
         if (!window_) {
             REXLOG_ERROR("Failed to create window");
             return false;
@@ -606,12 +609,39 @@ public:
             rex::cvar::SetFlagByName("texture_cache_memory_limit_soft", "2048");
             rex::cvar::SetFlagByName("texture_cache_memory_limit_hard", "4096");
             rex::cvar::SetFlagByName("d3d12_tiled_shared_memory", "false");
-            // Let the game prepare the next command buffer while the GPU thread
-            // executes the previous one (queue depth 1). "gpu_queue.txt" next
+            // Host RAM cache for repeated immutable packfile reads. Grow on
+            // demand, keeping the Xbox guest address space and GPU budgets intact.
+            int ram_cache_mb = 256;
+#ifdef _WIN32
+            MEMORYSTATUSEX ram{};
+            ram.dwLength = sizeof(ram);
+            if (GlobalMemoryStatusEx(&ram)) {
+                ram_cache_mb = ram.ullTotalPhys >= 15ull * 1024 * 1024 * 1024 ? 1024 : 256;
+            }
+#endif
+            const auto cache_setting = rex::filesystem::GetExecutableFolder() / "ram_cache_mb.txt";
+            if (FILE* cf = std::fopen(cache_setting.string().c_str(), "rb")) {
+                int value = 0;
+                if (std::fscanf(cf, "%d", &value) == 1 && value >= 0 && value <= 4096) {
+                    ram_cache_mb = value;
+                }
+                std::fclose(cf);
+            }
+#ifdef _WIN32
+            if (ram.dwMemoryLoad <= 100 && ram.ullTotalPhys) {
+                const int available_budget = int(ram.ullAvailPhys / (4ull * 1024 * 1024));
+                if (ram_cache_mb > available_budget) ram_cache_mb = available_budget;
+            }
+#endif
+            rex::cvar::SetFlagByName("host_read_cache_mb", std::to_string(ram_cache_mb));
+            REXLOG_INFO("Packfile RAM read cache budget: {} MiB (fills on demand)", ram_cache_mb);
+            // Let the game prepare the next command buffers while the GPU thread
+            // executes earlier ones (queue depth 8; each queued buffer carries
+            // copies of the command memory it uses). "gpu_queue.txt" next
             // to the exe sets another depth; a file named "sync_gpu" turns it
             // off (wait for every buffer, the old behaviour).
             {
-                int depth = 1;
+                int depth = 8;
                 if (FILE* qf = std::fopen("gpu_queue.txt", "rb")) {
                     int v = 0;
                     if (std::fscanf(qf, "%d", &v) == 1 && v >= 0 && v <= 64) depth = v;

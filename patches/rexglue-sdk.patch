@@ -1,3 +1,15 @@
+diff --git a/include/rex/filesystem/devices/host_path_file.h b/include/rex/filesystem/devices/host_path_file.h
+index 789315c..eaa592f 100644
+--- a/include/rex/filesystem/devices/host_path_file.h
++++ b/include/rex/filesystem/devices/host_path_file.h
+@@ -36,6 +36,7 @@ class HostPathFile : public File {
+ 
+  private:
+   std::unique_ptr<rex::filesystem::FileHandle> file_handle_;
++  uint64_t read_cache_id_ = 0;
+ };
+ 
+ }  // namespace rex::filesystem
 diff --git a/include/rex/filesystem/vfs.h b/include/rex/filesystem/vfs.h
 index 96f86fe..9377c14 100644
 --- a/include/rex/filesystem/vfs.h
@@ -68,10 +80,41 @@ index da8e432..2562d4b 100644
    // MicroEngine binary from PM4_ME_INIT
    std::vector<uint32_t> me_bin_;
 diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
-index 96d362b..be97856 100644
+index 96d362b..88f0246 100644
 --- a/include/rex/graphics/d3d12/command_processor.h
 +++ b/include/rex/graphics/d3d12/command_processor.h
-@@ -405,8 +405,9 @@ class D3D12CommandProcessor : public CommandProcessor {
+@@ -46,6 +46,30 @@ namespace rex::graphics::d3d12 {
+ 
+ class D3D12CommandProcessor : public CommandProcessor {
+  public:
++  // GPU time per kind of work, measured with timestamp queries when a file
++  // named "gpu_timing" is next to the executable; logged every few seconds.
++  enum GpuTimeCategory : uint8_t {
++    kGpuTimeDraw,
++    kGpuTimeRenderTargetTransfer,
++    kGpuTimeTextureLoad,
++    kGpuTimeResolve,
++    kGpuTimeUpload,
++    kGpuTimeSwap,
++    kGpuTimeCategoryCount
++  };
++  // Switches the category the following GPU commands count towards; returns
++  // the previous one.
++  uint8_t GpuTimerSwitch(uint8_t category);
++  // Per-frame counters for the GPU timing log.
++  uint64_t gpu_count_draws_ = 0, gpu_count_barriers_ = 0, gpu_count_barrier_batches_ = 0,
++           gpu_count_uploads_ = 0, gpu_count_upload_bytes_ = 0;
++  struct GpuTimeScope {
++    GpuTimeScope(D3D12CommandProcessor& cp, uint8_t category)
++        : cp_(cp), previous_(cp.GpuTimerSwitch(category)) {}
++    ~GpuTimeScope() { cp_.GpuTimerSwitch(previous_); }
++    D3D12CommandProcessor& cp_;
++    uint8_t previous_;
++  };
+   explicit D3D12CommandProcessor(D3D12GraphicsSystem* graphics_system,
+                                  system::KernelState* kernel_state);
+   ~D3D12CommandProcessor();
+@@ -405,8 +429,9 @@ class D3D12CommandProcessor : public CommandProcessor {
    bool InitializeOcclusionQueryResources();
    void ShutdownOcclusionQueryResources();
    bool BeginGuestOcclusionQuery(uint32_t sample_count_address);
@@ -83,7 +126,41 @@ index 96d362b..be97856 100644
    bool AcquireOcclusionQueryIndex(uint32_t& host_index_out);
    void DisableHostOcclusionQueries();
    uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
-@@ -659,6 +660,14 @@ class D3D12CommandProcessor : public CommandProcessor {
+@@ -649,6 +674,33 @@ class D3D12CommandProcessor : public CommandProcessor {
+   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
+ 
+   static constexpr uint32_t kMaxOcclusionQueries = 8192;
++  // GPU timing (see GpuTimeCategory).
++  static constexpr uint32_t kGpuTimerQueries = 65536;
++  static constexpr uint32_t kGpuTimerMaxPerSubmission = 8192;
++  bool gpu_timer_enabled_ = false;
++  Microsoft::WRL::ComPtr<ID3D12QueryHeap> gpu_timer_heap_;
++  Microsoft::WRL::ComPtr<ID3D12Resource> gpu_timer_readback_;
++  uint64_t* gpu_timer_mapping_ = nullptr;
++  uint64_t gpu_timer_frequency_ = 0;
++  uint32_t gpu_timer_cursor_ = 0;
++  uint32_t gpu_timer_start_ = 0;
++  uint8_t gpu_timer_category_ = 0;
++  std::vector<uint8_t> gpu_timer_intervals_;  // category after each timestamp
++  struct GpuTimerSubmission {
++    uint64_t submission;
++    uint32_t start;
++    std::vector<uint8_t> intervals;
++  };
++  std::deque<GpuTimerSubmission> gpu_timer_pending_;
++  double gpu_timer_seconds_[kGpuTimeCategoryCount] = {};
++  uint64_t gpu_timer_frames_ = 0;
++  uint64_t gpu_timer_last_log_ = 0;
++  void InitializeGpuTimer();
++  void GpuTimerWrite();
++  void GpuTimerBeginSubmission();
++  void GpuTimerEndSubmission();
++  void PollGpuTimer();
++
+   Microsoft::WRL::ComPtr<ID3D12QueryHeap> occlusion_query_heap_;
+   Microsoft::WRL::ComPtr<ID3D12Resource> occlusion_query_readback_;
+   uint64_t* occlusion_query_readback_mapping_ = nullptr;
+@@ -659,6 +711,14 @@ class D3D12CommandProcessor : public CommandProcessor {
      uint32_t host_index = UINT32_MAX;
      bool valid = false;
    } active_occlusion_query_;
@@ -122,6 +199,19 @@ index ac6b056..2d1e2eb 100644
  
    // May be called from any thread any number of times, even during recovery
    // from a device loss.
+diff --git a/include/rex/input/mnk/mnk_input_driver.h b/include/rex/input/mnk/mnk_input_driver.h
+index c8751b7..bda99c1 100644
+--- a/include/rex/input/mnk/mnk_input_driver.h
++++ b/include/rex/input/mnk/mnk_input_driver.h
+@@ -95,6 +95,8 @@ class MnkInputDriver final : public InputDriver,
+ 
+   // Guest thread to UI thread. The queued flag coalesces the posts.
+   std::atomic<bool> mouse_capture_requested_{false};
++  // UI-published state lets input polling avoid posting unchanged capture work.
++  std::atomic<bool> mouse_capture_applied_{false};
+   std::atomic<bool> mouse_capture_update_queued_{false};
+ 
+   std::atomic<bool> has_focus_{true};
 diff --git a/include/rex/system/interfaces/graphics.h b/include/rex/system/interfaces/graphics.h
 index d54df86..09a0939 100644
 --- a/include/rex/system/interfaces/graphics.h
@@ -135,6 +225,65 @@ index d54df86..09a0939 100644
  };
  
  }  // namespace rex::system
+diff --git a/resources/templates/codegen/pch_h.inja b/resources/templates/codegen/pch_h.inja
+index 68274d2..c4aa730 100644
+--- a/resources/templates/codegen/pch_h.inja
++++ b/resources/templates/codegen/pch_h.inja
+@@ -310,26 +310,36 @@ inline void ppc_trap(PPCContext& ctx, u8* base, u16 trap_type) {
+ // Interrupt Locks
+ //=============================================================================
+ 
+-inline std::atomic<i32>& ppc_global_lock_count_() {
+-  static std::atomic<i32> count{0};
+-  return count;
++// How many times this thread has entered the region (guest "interrupts off").
++inline i32& ppc_global_lock_depth_() {
++  thread_local i32 depth = 0;
++  return depth;
+ }
+ 
+-#define REX_CHECK_GLOBAL_LOCK()                                        \
+-  ([&]() -> u64 {                                                      \
+-    auto lock_ = rex::thread::global_critical_region::AcquireDirect(); \
+-    return ppc_global_lock_count_().load() ? 0 : 0x8000;               \
+-  }())
+-
+-#define REX_ENTER_GLOBAL_LOCK()                          \
+-  do {                                                   \
+-    rex::thread::global_critical_region::mutex().lock(); \
+-    ppc_global_lock_count_().fetch_add(1);               \
++// Reading the MSR only needs this thread's own state; it does not take the
++// lock (it used to lock and unlock the global mutex on every mfmsr).
++#define REX_CHECK_GLOBAL_LOCK() (u64(ppc_global_lock_depth_() ? 0 : 0x8000))
++
++// On the console, turning interrupts off only stops the current hardware
++// thread from being preempted; it never kept other cores out. The guest
++// regions that do it wrap lwarx/stwcx. updates, and stwcx. is already a real
++// compare-and-swap here, so no host lock is needed. Setting the environment
++// variable REX_GUEST_GLOBAL_LOCK=1 brings the old shared lock back.
++inline const bool ppc_guest_global_lock_ = [] {
++  const char* v = std::getenv("REX_GUEST_GLOBAL_LOCK");
++  return v && v[0] == '1';
++}();
++
++#define REX_ENTER_GLOBAL_LOCK()                                         \
++  do {                                                                  \
++    if (ppc_guest_global_lock_)                                         \
++      rex::thread::global_critical_region::mutex().lock();              \
++    ++ppc_global_lock_depth_();                                         \
+   } while (0)
+ 
+-#define REX_LEAVE_GLOBAL_LOCK()                                                           \
+-  do {                                                                                    \
+-    auto old_count_ = ppc_global_lock_count_().fetch_sub(1);                              \
+-    assert(old_count_ >= 1 && "LeaveGlobalLock called without matching EnterGlobalLock"); \
+-    rex::thread::global_critical_region::mutex().unlock();                                \
++#define REX_LEAVE_GLOBAL_LOCK()                                         \
++  do {                                                                  \
++    --ppc_global_lock_depth_();                                         \
++    if (ppc_guest_global_lock_)                                         \
++      rex::thread::global_critical_region::mutex().unlock();            \
+   } while (0)
 diff --git a/src/audio/audio_system.cpp b/src/audio/audio_system.cpp
 index 7a711a8..3bae941 100644
 --- a/src/audio/audio_system.cpp
@@ -215,6 +364,89 @@ index 7a711a8..3bae941 100644
  
    if (out_index) {
      *out_index = index;
+diff --git a/src/filesystem/devices/host_path_file.cpp b/src/filesystem/devices/host_path_file.cpp
+index 4c57a18..57341ec 100644
+--- a/src/filesystem/devices/host_path_file.cpp
++++ b/src/filesystem/devices/host_path_file.cpp
+@@ -11,14 +11,58 @@
+ 
+ #include <rex/filesystem/devices/host_path_entry.h>
+ #include <rex/filesystem/devices/host_path_file.h>
++#include <rex/filesystem/device.h>
++#include <rex/cvar.h>
++#include <rex/logging.h>
++#include <atomic>
++#include <chrono>
++#include "read_cache.h"
++
++REXCVAR_DEFINE_INT32(host_read_cache_mb, 0, "Filesystem", "RAM budget for immutable packfile reads (0 disables)");
+ 
+ namespace rex::filesystem {
+ 
++namespace {
++ReadCache& Cache() { static ReadCache cache; return cache; }
++std::atomic<uint64_t> next_cache_id{1};
++void LogCache() {
++  // Only runs on the IO path. Interval statistics measure actual avoided reads.
++  static std::mutex mutex;
++  std::unique_lock lock(mutex, std::try_to_lock);
++  if (!lock.owns_lock()) return;
++  static auto last = std::chrono::steady_clock::now();
++  auto now = std::chrono::steady_clock::now();
++  double seconds = std::chrono::duration<double>(now - last).count();
++  if (seconds < 2.0) return;
++  static ReadCache::Stats before;
++  auto current = Cache().GetStats();
++  REXLOG_INFO("RAM READ CACHE {} MiB / {} entries | hits {:.0f}/s misses {:.0f}/s | host reads avoided {:.1f} MiB/s",
++      current.bytes >> 20, current.entries, (current.hits - before.hits) / seconds,
++      (current.misses - before.misses) / seconds,
++      (current.saved_bytes - before.saved_bytes) / (1048576.0 * seconds));
++  before = current;
++  last = now;
++}
++}
++
+ HostPathFile::HostPathFile(uint32_t file_access, HostPathEntry* entry,
+                            std::unique_ptr<rex::filesystem::FileHandle> file_handle)
+-    : File(file_access, entry), file_handle_(std::move(file_handle)) {}
++    : File(file_access, entry), file_handle_(std::move(file_handle)) {
++  const auto budget = std::clamp(REXCVAR_GET(host_read_cache_mb), 0, 4096);
++  // Only immutable packfiles on read-only mounts, including mod overlays.
++  // Save files and other writable data always retain the direct IO path.
++  if (budget && entry->device()->is_read_only() &&
++      entry->host_path().extension() == ".vpp_xbox2" &&
++      !(file_access & (FileAccess::kGenericWrite | FileAccess::kFileWriteData |
++                      FileAccess::kFileAppendData | FileAccess::kGenericAll))) {
++    Cache().SetBudget(size_t(budget) * 1024 * 1024);
++    read_cache_id_ = next_cache_id.fetch_add(1, std::memory_order_relaxed);
++  }
++}
+ 
+-HostPathFile::~HostPathFile() = default;
++HostPathFile::~HostPathFile() {
++  if (read_cache_id_) Cache().EraseFile(read_cache_id_);
++}
+ 
+ void HostPathFile::Destroy() {
+   delete this;
+@@ -30,7 +74,17 @@ X_STATUS HostPathFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
+     return X_STATUS_ACCESS_DENIED;
+   }
+ 
++  const bool cacheable = read_cache_id_ && !buffer.empty() && buffer.size() <= 1024 * 1024;
++  if (cacheable && Cache().Read(read_cache_id_, byte_offset, buffer)) {
++    *out_bytes_read = buffer.size();
++    LogCache();
++    return X_STATUS_SUCCESS;
++  }
+   if (file_handle_->Read(byte_offset, buffer.data(), buffer.size(), out_bytes_read)) {
++    if (cacheable && *out_bytes_read == buffer.size()) {
++      Cache().Store(read_cache_id_, byte_offset, buffer);
++      LogCache();
++    }
+     return X_STATUS_SUCCESS;
+   } else {
+     return X_STATUS_END_OF_FILE;
 diff --git a/src/filesystem/virtual_file_system.cpp b/src/filesystem/virtual_file_system.cpp
 index a1b4dad..c249c5b 100644
 --- a/src/filesystem/virtual_file_system.cpp
@@ -296,10 +528,10 @@ index 0d8f8af..176bac7 100644
      VISIBILITY_INLINES_HIDDEN ON
  )
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index a744375..a2f7de2 100644
+index a744375..b70f3bd 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
-@@ -10,10 +10,15 @@
+@@ -10,10 +10,17 @@
   */
  
  #include <algorithm>
@@ -308,14 +540,16 @@ index a744375..a2f7de2 100644
  #include <cmath>
 +#include <condition_variable>
  #include <cstring>
++#include <functional>
 +#include <future>
 +#include <memory>
  #include <string_view>
++#include <unordered_map>
 +#include <vector>
  
  #include <fmt/format.h>
  
-@@ -37,6 +42,13 @@
+@@ -37,6 +44,13 @@
  
  REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
  
@@ -329,7 +563,7 @@ index a744375..a2f7de2 100644
  REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                      "Refresh page-valid state from GPU-written memory at frame end. "
                      "Disable for minor CPU overhead reduction, but may break memory coherency.")
-@@ -99,6 +111,13 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
+@@ -99,6 +113,22 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
    return ReadbackResolveMode::kDisabled;
  }
  
@@ -340,10 +574,19 @@ index a744375..a2f7de2 100644
 +// Nesting depth of INDIRECT_BUFFER execution on the command processor thread.
 +thread_local int indirect_buffer_depth = 0;
 +
++// Copies of the indirect buffers a queued command stream refers to, taken when
++// it was submitted. With a queue depth above 0 the game carries on while the
++// stream waits, and it reuses its command memory: executing the indirect
++// buffers from guest memory then read whatever the game had written there
++// since (packet overflows, broken resolves, crashes).
++using IbSnapshots = std::unordered_map<uint64_t, std::shared_ptr<std::vector<uint32_t>>>;
++thread_local const IbSnapshots* ib_snapshots = nullptr;
++inline uint64_t IbKey(uint32_t cpu_ptr, uint32_t count) { return (uint64_t(cpu_ptr) << 32) | count; }
++
  }  // namespace
  
  CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
-@@ -158,15 +177,149 @@ void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cach
+@@ -158,15 +188,192 @@ void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cach
                                                 uint32_t title_id, bool blocking) {}
  
  void CommandProcessor::CallInThread(std::function<void()> fn) {
@@ -460,13 +703,56 @@ index a744375..a2f7de2 100644
 +  // A spare dword distinguishes the full linear stream from an empty ring.
 +  auto bytes = std::make_shared<std::vector<uint8_t>>(size_bytes + 4);
 +  std::memcpy(bytes->data(), data, size_bytes);
++  // Queued streams: copy the indirect buffers they refer to now (nested ones
++  // too, as deep as execution goes), while they still hold this stream's data.
++  std::shared_ptr<IbSnapshots> snapshots;
++  if (!REXCVAR_GET(gpu_async_submit) && REXCVAR_GET(gpu_async_depth) > 0) {
++    snapshots = std::make_shared<IbSnapshots>();
++    size_t total = 0;
++    std::function<void(const uint32_t*, uint32_t, int)> scan = [&](const uint32_t* dwords, uint32_t n,
++                                                                   int depth) {
++      uint32_t i = 0;
++      while (i < n) {
++        const uint32_t header = rex::byte_swap(dwords[i]);
++        const uint32_t type = header >> 30;
++        if (type == 0) {
++          i += ((header >> 16) & 0x3FFFu) + 2u;
++        } else if (type == 1) {
++          i += 3u;
++        } else if (type == 2) {
++          i += 1u;
++        } else {
++          const uint32_t opcode = (header >> 8) & 0x7Fu;
++          const uint32_t count = ((header >> 16) & 0x3FFFu) + 1u;
++          if ((opcode == PM4_INDIRECT_BUFFER || opcode == PM4_INDIRECT_BUFFER_PFD) && count >= 2 &&
++              i + 2 < n && depth < 5) {
++            const uint32_t ptr = GpuToCpu(CpuToGpu(rex::byte_swap(dwords[i + 1])));
++            const uint32_t length = rex::byte_swap(dwords[i + 2]) & 0xFFFFFu;
++            const uint64_t key = IbKey(ptr, length);
++            if (length && total + length * 4u < (64u << 20) && !snapshots->count(key)) {
++              const uint32_t* src = SelectGuestDataSource(ptr, length);
++              auto copy = std::make_shared<std::vector<uint32_t>>(length + 1u, 0u);
++              std::memcpy(copy->data(), src, length * sizeof(uint32_t));
++              total += length * 4u;
++              (*snapshots)[key] = copy;
++              scan(copy->data(), length, depth + 1);
++            }
++          }
++          i += count + 1u;
++        }
++      }
++    };
++    scan(reinterpret_cast<const uint32_t*>(bytes->data()), size_bytes / 4u, 0);
++  }
 +  const uint64_t seq = submit_seq.fetch_add(1) + 1;
 +  const uint64_t submit_start = NowUs();
-+  CallInThread([this, bytes, size_bytes, seq]() {
++  CallInThread([this, bytes, size_bytes, seq, snapshots]() {
 +    const uint64_t exec_start = NowUs();
 +    memory::RingBuffer reader(bytes->data(), bytes->size());
 +    reader.set_write_offset(size_bytes);
++    ib_snapshots = snapshots.get();
 +    ExecutePacketsResync(&reader);
++    ib_snapshots = nullptr;
 +    OnPrimaryBufferEnd();
 +    stat_exec_us.fetch_add(NowUs() - exec_start, std::memory_order_relaxed);
 +    MarkDone(seq);
@@ -495,7 +781,7 @@ index a744375..a2f7de2 100644
  void CommandProcessor::InvalidateGpuMemory() {}
  
  ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
-@@ -204,9 +357,16 @@ void CommandProcessor::WorkerThreadMain() {
+@@ -204,9 +411,16 @@ void CommandProcessor::WorkerThreadMain() {
    }
  
    while (worker_running_) {
@@ -515,7 +801,7 @@ index a744375..a2f7de2 100644
        fn();
      }
  
-@@ -229,10 +389,10 @@ void CommandProcessor::WorkerThreadMain() {
+@@ -229,10 +443,10 @@ void CommandProcessor::WorkerThreadMain() {
          rex::thread::MaybeYield();
          loop_count++;
          write_ptr_index = write_ptr_index_.load();
@@ -528,7 +814,7 @@ index a744375..a2f7de2 100644
          continue;
        }
      }
-@@ -341,6 +501,12 @@ uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
+@@ -341,6 +555,12 @@ uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
  }
  
  void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
@@ -541,7 +827,7 @@ index a744375..a2f7de2 100644
    RegisterFile& regs = *register_file_;
    if (index >= RegisterFile::kRegisterCount) {
      auto [it, inserted] = extended_register_values_.insert_or_assign(index, value);
-@@ -355,9 +521,8 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+@@ -355,9 +575,8 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
  
    // Volatile for the WAIT_REG_MEM loop.
    const_cast<volatile uint32_t&>(regs.values[index]) = value;
@@ -553,7 +839,7 @@ index a744375..a2f7de2 100644
  
    // Scratch register writeback.
    if (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) {
-@@ -619,14 +784,7 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+@@ -619,14 +838,7 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
    memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
    reader.set_read_offset(read_index * sizeof(uint32_t));
    reader.set_write_offset(write_index * sizeof(uint32_t));
@@ -569,7 +855,7 @@ index a744375..a2f7de2 100644
  
    OnPrimaryBufferEnd();
  
-@@ -636,30 +794,85 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+@@ -636,30 +848,91 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
  void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
    SCOPE_profile_cpu_f("gpu");
  
@@ -581,8 +867,14 @@ index a744375..a2f7de2 100644
 +    return;
 +  }
 +
-+  uint8_t* ib_data =
-+      reinterpret_cast<uint8_t*>(const_cast<uint32_t*>(SelectGuestDataSource(ptr, count)));
++  uint8_t* ib_data = nullptr;
++  if (ib_snapshots) {
++    auto it = ib_snapshots->find(IbKey(ptr, count));
++    if (it != ib_snapshots->end()) ib_data = reinterpret_cast<uint8_t*>(it->second->data());
++  }
++  if (!ib_data) {
++    ib_data = reinterpret_cast<uint8_t*>(const_cast<uint32_t*>(SelectGuestDataSource(ptr, count)));
++  }
 +
    // Execute commands!
 -  memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
@@ -667,7 +959,7 @@ index a744375..a2f7de2 100644
  }
  
  bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
-@@ -702,6 +915,12 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
+@@ -702,6 +975,12 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
  
    uint32_t base_index = (packet & 0x7FFF);
    uint32_t write_one_reg = (packet >> 15) & 0x1;
@@ -680,7 +972,7 @@ index a744375..a2f7de2 100644
    for (uint32_t m = 0; m < count; m++) {
      uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
      uint32_t target_index = write_one_reg ? base_index : base_index + m;
-@@ -880,9 +1099,10 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
+@@ -880,9 +1159,10 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
      }
  
      default:
@@ -692,7 +984,7 @@ index a744375..a2f7de2 100644
        break;
    }
  
-@@ -989,8 +1209,30 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -989,8 +1269,30 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
  
    bool is_memory = (wait_info & 0x10) != 0;
  
@@ -723,7 +1015,7 @@ index a744375..a2f7de2 100644
      uint32_t value = 0;
      if (is_memory) {
        value =
-@@ -1033,8 +1275,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -1033,8 +1335,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
        // Wait.
        if (wait >= 0x100) {
          PrepareForWait();
@@ -737,7 +1029,7 @@ index a744375..a2f7de2 100644
            rex::thread::MaybeYield();
          } else {
            rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
-@@ -1052,6 +1297,13 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -1052,6 +1357,13 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
      }
    } while (!matched);
  
@@ -751,7 +1043,7 @@ index a744375..a2f7de2 100644
    return true;
  }
  
-@@ -1469,6 +1721,29 @@ bool CommandProcessor::ExecutePacketType3_SET_CONSTANT2(memory::RingBuffer* read
+@@ -1469,6 +1781,29 @@ bool CommandProcessor::ExecutePacketType3_SET_CONSTANT2(memory::RingBuffer* read
    return true;
  }
  
@@ -781,7 +1073,7 @@ index a744375..a2f7de2 100644
  bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer* reader,
                                                              uint32_t packet, uint32_t count) {
    // load constants from memory
-@@ -1479,7 +1754,7 @@ bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer*
+@@ -1479,7 +1814,7 @@ bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer*
    uint32_t size_dwords = reader->ReadAndSwap<uint32_t>();
    size_dwords &= 0xFFF;
    uint32_t type = (offset_type >> 16) & 0xFF;
@@ -790,7 +1082,7 @@ index a744375..a2f7de2 100644
    switch (type) {
      case 0:  // ALU
        WriteALURangeFromMem(index, xlat_address, size_dwords);
-@@ -1525,7 +1800,8 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
+@@ -1525,7 +1860,8 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
    assert_true(start == 0);
  
    auto shader =
@@ -801,10 +1093,19 @@ index a744375..a2f7de2 100644
      case xenos::ShaderType::kVertex:
        active_vertex_shader_ = shader;
 diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
-index 19874a5..8bdc486 100644
+index 19874a5..7f7841e 100644
 --- a/src/graphics/d3d12/command_processor.cpp
 +++ b/src/graphics/d3d12/command_processor.cpp
-@@ -161,59 +161,38 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
+@@ -10,6 +10,8 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cstdio>
+ #include <cstdarg>
+ #include <cstring>
+ #include <sstream>
+@@ -161,59 +163,38 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
    uint32_t initiator = reader->ReadAndSwap<uint32_t>();
    WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
  
@@ -882,7 +1183,16 @@ index 19874a5..8bdc486 100644
    return true;
  }
  
-@@ -1502,9 +1481,11 @@ bool D3D12CommandProcessor::SetupContext() {
+@@ -256,6 +237,8 @@ void D3D12CommandProcessor::PushUAVBarrier(ID3D12Resource* resource) {
+ void D3D12CommandProcessor::SubmitBarriers() {
+   UINT barrier_count = UINT(barriers_.size());
+   if (barrier_count != 0) {
++    gpu_count_barriers_ += barrier_count;
++    ++gpu_count_barrier_batches_;
+     deferred_command_list_.D3DResourceBarrier(barrier_count, barriers_.data());
+     barriers_.clear();
+   }
+@@ -1502,9 +1485,11 @@ bool D3D12CommandProcessor::SetupContext() {
      // kNullTexture2DArray.
      D3D12_SHADER_RESOURCE_VIEW_DESC null_srv_desc;
      null_srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -896,10 +1206,28 @@ index 19874a5..8bdc486 100644
      null_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
      null_srv_desc.Texture2DArray.MostDetailedMip = 0;
      null_srv_desc.Texture2DArray.MipLevels = 1;
-@@ -2257,10 +2238,13 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+@@ -1619,6 +1604,7 @@ bool D3D12CommandProcessor::SetupContext() {
+   }
+ 
+   occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
++  InitializeGpuTimer();
+ 
+   // Just not to expose uninitialized memory.
+   std::memset(&system_constants_, 0, sizeof(system_constants_));
+@@ -1893,6 +1879,8 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
+ 
+ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                       uint32_t frontbuffer_height) {
++  GpuTimeScope gpu_time_scope(*this, kGpuTimeSwap);
++  ++gpu_timer_frames_;
+   SCOPE_profile_cpu_f("gpu");
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+@@ -2257,10 +2245,14 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
  }
  
  void D3D12CommandProcessor::OnPrimaryBufferEnd() {
++  PollGpuTimer();
 +  // Keep an occlusion query that spans command buffers within one submission,
 +  // since a host query cannot cross submissions.
    if (REXCVAR_GET(d3d12_submit_on_primary_buffer_end) && submission_open_ &&
@@ -911,7 +1239,16 @@ index 19874a5..8bdc486 100644
  }
  
  Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
-@@ -2398,8 +2382,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+@@ -2271,6 +2263,8 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_
+ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
+                                       IndexBufferInfo* index_buffer_info,
+                                       bool major_mode_explicit) {
++  GpuTimerSwitch(kGpuTimeDraw);
++  ++gpu_count_draws_;
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -2398,8 +2392,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
            bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature)) {
      return false;
    }
@@ -923,7 +1260,154 @@ index 19874a5..8bdc486 100644
      return true;
    }
  
-@@ -4890,6 +4875,7 @@ void D3D12CommandProcessor::DisableHostOcclusionQueries() {
+@@ -2871,6 +2866,7 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
+ }
+ 
+ bool D3D12CommandProcessor::IssueCopy() {
++  GpuTimeScope gpu_time_scope(*this, kGpuTimeResolve);
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -3302,6 +3298,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+     // end of the submission (when async pipeline creation requests are
+     // fulfilled).
+     deferred_command_list_.Reset();
++    GpuTimerBeginSubmission();
+ 
+     // Reset cached state of the command list.
+     ff_viewport_update_needed_ = true;
+@@ -3413,6 +3410,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+     // Submit barriers now because resources with the queued barriers may be
+     // destroyed between frames.
+     SubmitBarriers();
++    GpuTimerEndSubmission();
+ 
+     ID3D12CommandQueue* direct_queue = provider.GetDirectQueue();
+ 
+@@ -4802,6 +4800,122 @@ ID3D12Resource* D3D12CommandProcessor::RequestReadbackBuffer(uint32_t size) {
+   return readback_buffer_;
+ }
+ 
++void D3D12CommandProcessor::InitializeGpuTimer() {
++  gpu_timer_enabled_ = false;
++  if (FILE* f = std::fopen("gpu_timing", "rb")) {
++    std::fclose(f);
++  } else {
++    return;
++  }
++  ID3D12Device* device = GetD3D12Provider().GetDevice();
++  ID3D12CommandQueue* queue = GetD3D12Provider().GetDirectQueue();
++  if (!device || !queue || FAILED(queue->GetTimestampFrequency(&gpu_timer_frequency_)) ||
++      !gpu_timer_frequency_) {
++    return;
++  }
++  D3D12_QUERY_HEAP_DESC heap_desc = {};
++  heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
++  heap_desc.Count = kGpuTimerQueries;
++  if (FAILED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&gpu_timer_heap_)))) {
++    return;
++  }
++  D3D12_RESOURCE_DESC buffer_desc;
++  ui::d3d12::util::FillBufferResourceDesc(buffer_desc, sizeof(uint64_t) * kGpuTimerQueries,
++                                          D3D12_RESOURCE_FLAG_NONE);
++  if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesReadback,
++                                             GetD3D12Provider().GetHeapFlagCreateNotZeroed(),
++                                             &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
++                                             IID_PPV_ARGS(&gpu_timer_readback_)))) {
++    gpu_timer_heap_.Reset();
++    return;
++  }
++  D3D12_RANGE read_range = {0, sizeof(uint64_t) * kGpuTimerQueries};
++  void* mapping = nullptr;
++  if (FAILED(gpu_timer_readback_->Map(0, &read_range, &mapping))) {
++    gpu_timer_readback_.Reset();
++    gpu_timer_heap_.Reset();
++    return;
++  }
++  gpu_timer_mapping_ = reinterpret_cast<uint64_t*>(mapping);
++  gpu_timer_enabled_ = true;
++  REXLOG_INFO("GPU timing enabled (timestamp frequency {})", gpu_timer_frequency_);
++}
++
++void D3D12CommandProcessor::GpuTimerWrite() {
++  deferred_command_list_.D3DEndQuery(gpu_timer_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                     gpu_timer_cursor_++);
++  gpu_timer_intervals_.push_back(gpu_timer_category_);
++}
++
++uint8_t D3D12CommandProcessor::GpuTimerSwitch(uint8_t category) {
++  const uint8_t previous = gpu_timer_category_;
++  if (category == previous) return previous;
++  gpu_timer_category_ = category;
++  if (gpu_timer_enabled_ && submission_open_ &&
++      gpu_timer_cursor_ - gpu_timer_start_ < kGpuTimerMaxPerSubmission - 1) {
++    GpuTimerWrite();
++  }
++  return previous;
++}
++
++void D3D12CommandProcessor::GpuTimerBeginSubmission() {
++  if (!gpu_timer_enabled_) return;
++  if (gpu_timer_cursor_ + kGpuTimerMaxPerSubmission > kGpuTimerQueries) gpu_timer_cursor_ = 0;
++  gpu_timer_start_ = gpu_timer_cursor_;
++  gpu_timer_intervals_.clear();
++  GpuTimerWrite();
++}
++
++void D3D12CommandProcessor::GpuTimerEndSubmission() {
++  if (!gpu_timer_enabled_ || gpu_timer_intervals_.empty()) return;
++  GpuTimerWrite();
++  const uint32_t count = gpu_timer_cursor_ - gpu_timer_start_;
++  deferred_command_list_.D3DResolveQueryData(gpu_timer_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                             gpu_timer_start_, count, gpu_timer_readback_.Get(),
++                                             sizeof(uint64_t) * gpu_timer_start_);
++  gpu_timer_pending_.push_back({submission_current_, gpu_timer_start_, gpu_timer_intervals_});
++  gpu_timer_intervals_.clear();
++}
++
++void D3D12CommandProcessor::PollGpuTimer() {
++  if (!gpu_timer_enabled_) return;
++  while (!gpu_timer_pending_.empty() && gpu_timer_pending_.front().submission <= submission_completed_) {
++    const GpuTimerSubmission& s = gpu_timer_pending_.front();
++    for (size_t i = 0; i + 1 < s.intervals.size(); ++i) {
++      const uint64_t a = gpu_timer_mapping_[s.start + i], b = gpu_timer_mapping_[s.start + i + 1];
++      if (b > a && s.intervals[i] < kGpuTimeCategoryCount) {
++        gpu_timer_seconds_[s.intervals[i]] += double(b - a) / double(gpu_timer_frequency_);
++      }
++    }
++    gpu_timer_pending_.pop_front();
++  }
++  const uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
++                                    std::chrono::steady_clock::now().time_since_epoch())
++                                    .count());
++  if (!gpu_timer_last_log_) gpu_timer_last_log_ = now;
++  if (now - gpu_timer_last_log_ >= 2000 && gpu_timer_frames_) {
++    const double f = 1000.0 / double(gpu_timer_frames_);
++    double total = 0;
++    for (double v : gpu_timer_seconds_) total += v;
++    REXLOG_INFO(
++        "GPU TIME per frame: total {:.2f} ms | draws {:.2f} | render target transfers {:.2f} | "
++        "texture loads {:.2f} | resolves {:.2f} | uploads {:.2f} | swap {:.2f} ({} frames) | per "
++        "frame: {} draws, {} barriers in {} batches, {} uploads ({} KB)",
++        total * f, gpu_timer_seconds_[kGpuTimeDraw] * f,
++        gpu_timer_seconds_[kGpuTimeRenderTargetTransfer] * f,
++        gpu_timer_seconds_[kGpuTimeTextureLoad] * f, gpu_timer_seconds_[kGpuTimeResolve] * f,
++        gpu_timer_seconds_[kGpuTimeUpload] * f, gpu_timer_seconds_[kGpuTimeSwap] * f,
++        gpu_timer_frames_, gpu_count_draws_ / gpu_timer_frames_,
++        gpu_count_barriers_ / gpu_timer_frames_, gpu_count_barrier_batches_ / gpu_timer_frames_,
++        gpu_count_uploads_ / gpu_timer_frames_, gpu_count_upload_bytes_ / 1024 / gpu_timer_frames_);
++    gpu_count_draws_ = gpu_count_barriers_ = gpu_count_barrier_batches_ = gpu_count_uploads_ =
++        gpu_count_upload_bytes_ = 0;
++    for (double& v : gpu_timer_seconds_) v = 0;
++    gpu_timer_frames_ = 0;
++    gpu_timer_last_log_ = now;
++  }
++}
++
+ bool D3D12CommandProcessor::InitializeOcclusionQueryResources() {
+   active_occlusion_query_ = {};
+   occlusion_query_cursor_ = 0;
+@@ -4890,6 +5004,7 @@ void D3D12CommandProcessor::DisableHostOcclusionQueries() {
    }
    occlusion_query_cursor_ = 0;
    occlusion_query_resources_available_ = false;
@@ -931,7 +1415,7 @@ index 19874a5..8bdc486 100644
  }
  
  bool D3D12CommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_address) {
-@@ -4897,9 +4883,13 @@ bool D3D12CommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_addre
+@@ -4897,9 +5012,13 @@ bool D3D12CommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_addre
      return false;
    }
    if (active_occlusion_query_.valid) {
@@ -948,7 +1432,7 @@ index 19874a5..8bdc486 100644
      return false;
    }
  
-@@ -4919,43 +4909,49 @@ bool D3D12CommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_addre
+@@ -4919,43 +5038,49 @@ bool D3D12CommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_addre
    return true;
  }
  
@@ -1019,8 +1503,37 @@ index 19874a5..8bdc486 100644
  }
  
  uint64_t D3D12CommandProcessor::NormalizeOcclusionSamples(uint64_t samples) const {
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index dd321a5..a1f731e 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -3798,6 +3798,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
+     const std::vector<Transfer>* render_target_transfers,
+     const uint64_t* render_target_resolve_clear_values,
+     const Transfer::Rectangle* resolve_clear_rectangle) {
++  D3D12CommandProcessor::GpuTimeScope gpu_time_scope(command_processor_, D3D12CommandProcessor::kGpuTimeRenderTargetTransfer);
+   assert_true(GetPath() == Path::kHostRenderTargets);
+ 
+   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+diff --git a/src/graphics/d3d12/shared_memory.cpp b/src/graphics/d3d12/shared_memory.cpp
+index a5c97a0..8b2ec69 100644
+--- a/src/graphics/d3d12/shared_memory.cpp
++++ b/src/graphics/d3d12/shared_memory.cpp
+@@ -303,9 +303,12 @@ bool D3D12SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocat
+ 
+ bool D3D12SharedMemory::UploadRanges(
+     const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
++  D3D12CommandProcessor::GpuTimeScope gpu_time_scope(command_processor_, D3D12CommandProcessor::kGpuTimeUpload);
+   if (upload_page_ranges.empty()) {
+     return true;
+   }
++  ++command_processor_.gpu_count_uploads_;
++  for (auto& r : upload_page_ranges) command_processor_.gpu_count_upload_bytes_ += uint64_t(r.second) << page_size_log2();
+   CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
+   command_processor_.SubmitBarriers();
+   auto& command_list = command_processor_.GetDeferredCommandList();
 diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
-index 2be0e8e..8297caa 100644
+index 2be0e8e..d15176c 100644
 --- a/src/graphics/d3d12/texture_cache.cpp
 +++ b/src/graphics/d3d12/texture_cache.cpp
 @@ -611,9 +611,11 @@ bool D3D12TextureCache::Initialize() {
@@ -1037,6 +1550,14 @@ index 2be0e8e..8297caa 100644
    null_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
    null_srv_desc.Texture2DArray.MostDetailedMip = 0;
    null_srv_desc.Texture2DArray.MipLevels = 1;
+@@ -1559,6 +1561,7 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
+ 
+ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
+                                                               bool load_mips) {
++  D3D12CommandProcessor::GpuTimeScope gpu_time_scope(command_processor_, D3D12CommandProcessor::kGpuTimeTextureLoad);
+   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
+   TextureKey texture_key = d3d12_texture.key();
+ 
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
 index 8f2fcb0..c12df68 100644
 --- a/src/graphics/graphics_system.cpp
@@ -1075,7 +1596,7 @@ index 8f2fcb0..c12df68 100644
    command_processor_->EnableReadPointerWriteBack(ptr, block_size_log2);
  }
 diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
-index 76f5600..4810d79 100644
+index 76f5600..6cb38fd 100644
 --- a/src/graphics/pipeline/texture/cache.cpp
 +++ b/src/graphics/pipeline/texture/cache.cpp
 @@ -10,6 +10,8 @@
@@ -1131,7 +1652,32 @@ index 76f5600..4810d79 100644
    // In case there was a failure to create something in the previous frame, make
    // sure bindings are reset so a new attempt will surely be made if the texture
    // is requested again.
-@@ -762,6 +787,7 @@ void TextureCache::DestroyAllTextures(bool from_destructor) {
+@@ -462,8 +487,12 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+ 
+   // Update the texture keys and the textures.
+   uint32_t bindings_changed = 0;
+-  std::vector<PendingTextureLoad> pending_texture_loads;
+-  std::vector<PendingSharedMemoryRange> pending_shared_memory_ranges;
++  // Reused between draws (this runs for every draw; fresh vectors cost a heap
++  // allocation each time something had to be loaded).
++  thread_local std::vector<PendingTextureLoad> pending_texture_loads;
++  thread_local std::vector<PendingSharedMemoryRange> pending_shared_memory_ranges;
++  pending_texture_loads.clear();
++  pending_shared_memory_ranges.clear();
+   auto queue_pending_texture_load = [&](Texture* texture) {
+     if (texture == nullptr) {
+       return;
+@@ -567,7 +596,8 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+                     uint32_t(pending_shared_memory_ranges.size()));
+ 
+   bool batched_shared_memory_request_succeeded = true;
+-  std::vector<std::pair<uint32_t, uint32_t>> pending_shared_memory_range_pairs;
++  thread_local std::vector<std::pair<uint32_t, uint32_t>> pending_shared_memory_range_pairs;
++  pending_shared_memory_range_pairs.clear();
+   if (!pending_shared_memory_ranges.empty()) {
+     pending_shared_memory_range_pairs.reserve(pending_shared_memory_ranges.size());
+     for (const PendingSharedMemoryRange& pending_range : pending_shared_memory_ranges) {
+@@ -762,6 +792,7 @@ void TextureCache::DestroyAllTextures(bool from_destructor) {
  }
  
  TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
@@ -1139,7 +1685,20 @@ index 76f5600..4810d79 100644
    // Check if the texture is a scaled resolve texture.
    if (IsDrawResolutionScaled() && key.tiled && IsScaledResolveSupportedForFormat(key)) {
      texture_util::TextureGuestLayout scaled_resolve_guest_layout = key.GetGuestLayout();
-@@ -867,7 +893,14 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
+@@ -775,6 +806,12 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
+     }
+   }
+ 
++  // Existing entries already passed extent validation when created. This path
++  // is hit tens of thousands of times per second during driving.
++  if (auto found = textures_.find(key); found != textures_.end()) {
++    return found->second.get();
++  }
++
+   auto get_host_extent = [this, &key](uint32_t& host_width_out, uint32_t& host_height_out,
+                                       uint32_t& host_depth_or_array_size_out) {
+     host_width_out = key.GetWidth();
+@@ -867,7 +904,14 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
    // Create the texture and add it to the map.
    Texture* texture;
    {
@@ -1154,7 +1713,7 @@ index 76f5600..4810d79 100644
      if (!new_texture) {
        key.LogAction("Failed to create");
        return nullptr;
-@@ -1035,7 +1068,9 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
+@@ -1035,7 +1079,9 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
    uint32_t block_last = page_last >> 5;
    uint32_t l2_block_first = block_first >> 6;
    uint32_t l2_block_last = block_last >> 6;
@@ -1165,6 +1724,73 @@ index 76f5600..4810d79 100644
    for (uint32_t i = l2_block_first; i <= l2_block_last; ++i) {
      uint64_t l2_block = scaled_resolve_pages_l2_[i];
      if (i == l2_block_first) {
+diff --git a/src/graphics/pipeline/texture/util.cpp b/src/graphics/pipeline/texture/util.cpp
+index 26d554c..28ddc03 100644
+--- a/src/graphics/pipeline/texture/util.cpp
++++ b/src/graphics/pipeline/texture/util.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <cstring>
++#include <unordered_map>
+ 
+ #include <rex/assert.h>
+ #include <rex/graphics/pipeline/texture/util.h>
+@@ -199,12 +200,54 @@ bool GetPackedMipOffset(uint32_t width, uint32_t height, uint32_t depth,
+   return true;
+ }
+ 
++static TextureGuestLayout ComputeGuestTextureLayout(
++    xenos::DataDimension dimension, uint32_t base_pitch_texels_div_32, uint32_t width_texels,
++    uint32_t height_texels, uint32_t depth_or_array_size, bool is_tiled, xenos::TextureFormat format,
++    bool has_packed_levels, bool has_base, uint32_t max_level);
++
++// The layout only depends on these parameters, and the same few hundred
++// textures are looked at on every draw, so results are kept per thread.
+ TextureGuestLayout GetGuestTextureLayout(xenos::DataDimension dimension,
+                                          uint32_t base_pitch_texels_div_32, uint32_t width_texels,
+                                          uint32_t height_texels, uint32_t depth_or_array_size,
+                                          bool is_tiled, xenos::TextureFormat format,
+                                          bool has_packed_levels, bool has_base,
+                                          uint32_t max_level) {
++  struct Key {
++    uint64_t a, b;
++    bool operator==(const Key& o) const { return a == o.a && b == o.b; }
++  };
++  struct KeyHash {
++    size_t operator()(const Key& k) const {
++      return size_t(k.a * 0x9E3779B97F4A7C15ull ^ (k.b + 0x632BE59BD9B4E019ull + (k.a << 6)));
++    }
++  };
++  thread_local std::unordered_map<Key, TextureGuestLayout, KeyHash> cache;
++  const Key key{uint64_t(width_texels) | (uint64_t(height_texels) << 24) |
++                    (uint64_t(uint32_t(dimension) & 0xFF) << 48) |
++                    (uint64_t(uint32_t(format) & 0xFF) << 56),
++                uint64_t(base_pitch_texels_div_32) | (uint64_t(depth_or_array_size) << 24) |
++                    (uint64_t(max_level & 0xFF) << 48) | (uint64_t(is_tiled) << 56) |
++                    (uint64_t(has_packed_levels) << 57) | (uint64_t(has_base) << 58)};
++  auto it = cache.find(key);
++  if (it != cache.end()) {
++    return it->second;
++  }
++  if (cache.size() >= 8192) {
++    cache.clear();
++  }
++  TextureGuestLayout layout =
++      ComputeGuestTextureLayout(dimension, base_pitch_texels_div_32, width_texels, height_texels,
++                                depth_or_array_size, is_tiled, format, has_packed_levels, has_base,
++                                max_level);
++  cache.emplace(key, layout);
++  return layout;
++}
++
++static TextureGuestLayout ComputeGuestTextureLayout(
++    xenos::DataDimension dimension, uint32_t base_pitch_texels_div_32, uint32_t width_texels,
++    uint32_t height_texels, uint32_t depth_or_array_size, bool is_tiled, xenos::TextureFormat format,
++    bool has_packed_levels, bool has_base, uint32_t max_level) {
+   TextureGuestLayout layout;
+ 
+   if (dimension == xenos::DataDimension::k1D) {
 diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
 index ec0df7c..f4c5d19 100644
 --- a/src/graphics/shared_memory.cpp
@@ -1351,6 +1977,39 @@ index 813bb1c..811d52a 100644
      if (result == X_ERROR_SUCCESS) {
        out_keystroke->user_index = static_cast<uint8_t>(user_index);
        return result;
+diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
+index 3f9422d..943eea5 100644
+--- a/src/input/mnk/mnk_input_driver.cpp
++++ b/src/input/mnk/mnk_input_driver.cpp
+@@ -398,6 +398,12 @@ void MnkInputDriver::EnqueueKeystroke(uint16_t vk_pad, bool down) {
+ 
+ void MnkInputDriver::QueueMouseCaptureUpdate(bool should_capture) {
+   mouse_capture_requested_.store(should_capture, std::memory_order_relaxed);
++  // Polling input is frequent. Only wake the UI when capture needs to change.
++  // Compare with applied state, not the previous request: if no window was
++  // available, a later poll must retry the outstanding request.
++  if (should_capture == mouse_capture_applied_.load(std::memory_order_relaxed)) {
++    return;
++  }
+   bool already_queued = false;
+   if (!mouse_capture_update_queued_.compare_exchange_strong(already_queued, true)) {
+     return;
+@@ -432,6 +438,7 @@ void MnkInputDriver::ApplyMouseCaptureFromUIThread() {
+   window->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
+   window->CaptureMouse();
+   relative_mouse_mode_ = window->SetRelativeMouseMode(true);
++  mouse_capture_applied_.store(true, std::memory_order_relaxed);
+   if (!relative_mouse_mode_) {
+     REXLOG_WARN("Pointer lock unavailable, mouse look falls back to recentering the cursor");
+   }
+@@ -450,6 +457,7 @@ void MnkInputDriver::ReleaseMouseCaptureFromUIThread(rex::ui::Window* window) {
+   window->SetRelativeMouseMode(false);
+   relative_mouse_mode_ = false;
+   window->ReleaseMouse();
++  mouse_capture_applied_.store(false, std::memory_order_relaxed);
+ }
+ 
+ void MnkInputDriver::RecenterCursorFromUIThread(int32_t x, int32_t y) {
 diff --git a/src/system/function_dispatcher.cpp b/src/system/function_dispatcher.cpp
 index bd43109..7c34df1 100644
 --- a/src/system/function_dispatcher.cpp
@@ -1384,6 +2043,33 @@ index bd43109..7c34df1 100644
  }
  
  PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 77bce25..1707cc2 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -894,12 +894,18 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
+     pcr.prcb_data.current_cpu = cpu_index;
+   }
+ 
++  // Guest CPU bookkeeping above is required even when the host scheduler
++  // chooses placement. In that mode there is no six-core host requirement.
++  if (REXCVAR_GET(ignore_thread_affinities)) {
++    return;
++  }
+   if (rex::thread::logical_processor_count() >= 6) {
+-    if (!REXCVAR_GET(ignore_thread_affinities)) {
+-      thread_->set_affinity_mask(uint64_t(1) << cpu_index);
+-    }
++    thread_->set_affinity_mask(uint64_t(1) << cpu_index);
+   } else {
+-    REXSYS_WARN("Too few processor cores - scheduling will be wonky");
++    static std::atomic_flag warned = ATOMIC_FLAG_INIT;
++    if (!warned.test_and_set(std::memory_order_relaxed)) {
++      REXSYS_WARN("Fewer than six logical processors; leaving host thread placement to the scheduler");
++    }
+   }
+ }
+ 
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
 index 7360ed9..3841acf 100644
 --- a/src/ui/presenter.cpp
