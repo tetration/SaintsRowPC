@@ -26,6 +26,9 @@
 #include <thread>
 #include <unordered_map>
 
+#include <windows.h>
+#include <tlhelp32.h>
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -98,8 +101,8 @@ PPC_FUNC(sub_825E54A8) {
     }
     // The game is held to 60 frames per second at most (it normally caps
     // itself at 30; mods can raise that).
-    // In the background (e.g. a second copy for co-op) run at 30 at most, so
-    // two copies on one PC don't fight over the GPU and stall each other.
+    // In the background, with a second copy on the same PC, run at 30 at
+    // most, so two copies don't fight over the GPU and stall each other.
     {
         static uint32_t focus_check = 0;
         static bool background = false;
@@ -120,7 +123,24 @@ PPC_FUNC(sub_825E54A8) {
             background = now_background;
         }
         int cap = sr::g_fps_cap.load(std::memory_order_relaxed);
-        if (background && cap > 30) cap = 30;
+        // Only when another copy runs on this PC: in a real co-op session the
+        // host tabbing out slowed its whole world (frame times past the
+        // game's own step limit), and the other player's copies of its people
+        // and cars tried to keep walking and jittered.
+        static bool other_copy = false;
+        if ((focus_check & 511) == 1) {
+            int copies = 0;
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (snap != INVALID_HANDLE_VALUE) {
+                PROCESSENTRY32W pe{};
+                pe.dwSize = sizeof(pe);
+                for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe))
+                    if (_wcsicmp(pe.szExeFile, L"saintsrow.exe") == 0) ++copies;
+                CloseHandle(snap);
+            }
+            other_copy = copies >= 2;
+        }
+        if (background && other_copy && cap > 30) cap = 30;
         sr::LimitFrameRate(double(cap));
     }
     sr::g_game_frames.fetch_add(1, std::memory_order_relaxed);

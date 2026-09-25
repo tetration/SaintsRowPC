@@ -16,6 +16,8 @@
 - Character creator controls for keyboard and mouse, and X / Y keys in the
   menus (for example Select Device).
 - Cutscenes can be skipped with a mouse click.
+- Smoother frame pacing: more GPU work can be queued safely, fewer stutters.
+- Fixed crashes from the GPU reading command memory the game had already reused.
 - First Person: better seat position in vehicles with a look limit, stays
   above the water while swimming, switches to the normal camera when bailing
   out of a moving car, and no more camera jitter while driving.

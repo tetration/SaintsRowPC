@@ -589,12 +589,13 @@ public:
 #endif
             rex::cvar::SetFlagByName("host_read_cache_mb", std::to_string(ram_cache_mb));
             REXLOG_INFO("Packfile RAM read cache budget: {} MiB (fills on demand)", ram_cache_mb);
-            // Let the game prepare the next command buffer while the GPU thread
-            // executes the previous one (queue depth 1). "gpu_queue.txt" next
+            // Let the game prepare the next command buffers while the GPU thread
+            // executes earlier ones (queue depth 8; each queued buffer carries
+            // copies of the command memory it uses). "gpu_queue.txt" next
             // to the exe sets another depth; a file named "sync_gpu" turns it
             // off (wait for every buffer, the old behaviour).
             {
-                int depth = 1;
+                int depth = 8;
                 if (FILE* qf = std::fopen("gpu_queue.txt", "rb")) {
                     int v = 0;
                     if (std::fscanf(qf, "%d", &v) == 1 && v >= 0 && v <= 64) depth = v;
