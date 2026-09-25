@@ -10,6 +10,7 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -32,9 +33,12 @@ void ApplyFullscreenDisplayMode(rex::ui::Window* window, int width, int height);
 class DisplaySettingsDialog : public rex::ui::ImGuiDialog {
 public:
     // config_path: where confirmed settings are written (saintsrow.toml).
-    // fps_overlay: the F1 frame-rate counter, toggled from the menu.
+    // fps_overlay: the F1 frame-rate counter, shown in the menu checkbox.
+    // set_fps_visible: toggles it; must be deferred out of the draw pass
+    // (destroying the overlay's dialog mid-draw crashes the presenter).
     DisplaySettingsDialog(rex::ui::ImGuiDrawer* imgui_drawer, rex::ui::Window* window,
-                          std::filesystem::path config_path, sr::FpsOverlay* fps_overlay);
+                          std::filesystem::path config_path, sr::FpsOverlay* fps_overlay,
+                          std::function<void(bool)> set_fps_visible);
     ~DisplaySettingsDialog() override;
 
 protected:
@@ -68,6 +72,7 @@ private:
     rex::ui::Window* window_;
     std::filesystem::path config_path_;
     sr::FpsOverlay* fps_overlay_ = nullptr;
+    std::function<void(bool)> set_fps_visible_;
     std::string device_name_;  // Win32 display device (e.g. \\.\DISPLAY1)
 
     std::vector<Mode> modes_;

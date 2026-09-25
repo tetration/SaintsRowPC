@@ -775,7 +775,11 @@ public:
                     display_dialog_.reset();
                 } else {
                     display_dialog_ = std::make_unique<DisplaySettingsDialog>(
-                        imgui_drawer_.get(), window_.get(), config_path_, &fps_overlay_);
+                        imgui_drawer_.get(), window_.get(), config_path_, &fps_overlay_,
+                        [this](bool visible) {
+                            app_context().CallInUIThreadDeferred(
+                                [this, visible] { fps_overlay_.SetVisible(visible); });
+                        });
                 }
             });
             if (REXCVAR_GET(fps_counter)) {

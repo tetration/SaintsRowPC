@@ -132,11 +132,13 @@ void ApplyFullscreenDisplayMode(rex::ui::Window* window, int width, int height) 
 DisplaySettingsDialog::DisplaySettingsDialog(rex::ui::ImGuiDrawer* imgui_drawer,
                                              rex::ui::Window* window,
                                              std::filesystem::path config_path,
-                                             sr::FpsOverlay* fps_overlay)
+                                             sr::FpsOverlay* fps_overlay,
+                                             std::function<void(bool)> set_fps_visible)
     : ImGuiDialog(imgui_drawer),
       window_(window),
       config_path_(std::move(config_path)),
-      fps_overlay_(fps_overlay) {
+      fps_overlay_(fps_overlay),
+      set_fps_visible_(std::move(set_fps_visible)) {
     std::string wm = REXCVAR_GET(window_mode);
     for (int i = 0; i < 3; ++i) {
         if (wm == kWindowModeValues[i]) {
@@ -479,8 +481,10 @@ void DisplaySettingsDialog::OnDraw(ImGuiIO& io) {
         // Read the live state so F1 toggles are reflected here too.
         bool fps = fps_overlay_ && fps_overlay_->IsVisible();
         if (ImGui::Checkbox("Show FPS counter (F1)", &fps)) {
-            if (fps_overlay_) {
-                fps_overlay_->SetVisible(fps);
+            // Deferred: destroying the overlay's dialog mid-draw would make
+            // the presenter mutate its drawer list while iterating it.
+            if (set_fps_visible_) {
+                set_fps_visible_(fps);
             }
             rex::cvar::SetFlagByName("fps_counter", fps ? "true" : "false");
             rex::cvar::SaveConfig(config_path_);
