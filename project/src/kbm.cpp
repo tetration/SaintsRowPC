@@ -589,11 +589,18 @@ PPC_FUNC(sub_8210D518) {
   // between calls, so a turn from the mouse kept going after the mouse
   // stopped (the view swung off to the side). Clear them when there is no
   // mouse input.
+  // Only a turn the mouse wrote is cleared (once): the controller's right
+  // stick writes these inputs itself, and clearing them every call stopped
+  // the stick from looking around in vehicles.
   const bool in_vehicle = PlayerInVehicle(base);
-  if (in_vehicle && dx == 0 && dy == 0 && mod_turn == 0) {
-    StoreF32(base, kCamera + 320, 0.0f);
-    StoreF32(base, kCamera + 324, 0.0f);
-    StoreF32(base, kCamera + 336, 0.0f);
+  static bool mouse_turn_written = false;
+  if (dx == 0 && dy == 0 && mod_turn == 0) {
+    if (in_vehicle && mouse_turn_written) {
+      StoreF32(base, kCamera + 320, 0.0f);
+      StoreF32(base, kCamera + 324, 0.0f);
+      StoreF32(base, kCamera + 336, 0.0f);
+    }
+    mouse_turn_written = false;
   }
 
   if ((dx == 0 && dy == 0 && mod_turn == 0) || !(dt > 0.0001) || dt > 0.5) {
@@ -662,6 +669,7 @@ PPC_FUNC(sub_8210D518) {
   StoreF32(base, kCamera + 320, float(yaw));
   StoreF32(base, kCamera + 324, 0.0f);
   StoreF32(base, kCamera + 336, float(pitch));
+  mouse_turn_written = true;
   __imp__sub_8210D518(ctx, base);
   StoreF32(base, kSlowPanH, slow_h);
   StoreF32(base, kSlowPanV, slow_v);
