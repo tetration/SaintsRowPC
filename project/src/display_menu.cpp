@@ -16,6 +16,7 @@
 #include <rex/logging.h>
 
 #include "kbm.h"
+#include "fps_overlay.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -28,6 +29,9 @@
 // Persisted window mode: "windowed", "borderless" or "fullscreen".
 REXCVAR_DEFINE_STRING(window_mode, "fullscreen", "UI/Window",
                       "Startup window mode: windowed, borderless or fullscreen");
+
+// Show the FPS counter at startup (the F1 overlay).
+REXCVAR_DEFINE_BOOL(fps_counter, false, "UI/Window", "Show the FPS counter overlay at startup");
 
 namespace {
 constexpr double kConfirmSeconds = 30.0;
@@ -127,8 +131,12 @@ void ApplyFullscreenDisplayMode(rex::ui::Window* window, int width, int height) 
 
 DisplaySettingsDialog::DisplaySettingsDialog(rex::ui::ImGuiDrawer* imgui_drawer,
                                              rex::ui::Window* window,
-                                             std::filesystem::path config_path)
-    : ImGuiDialog(imgui_drawer), window_(window), config_path_(std::move(config_path)) {
+                                             std::filesystem::path config_path,
+                                             sr::FpsOverlay* fps_overlay)
+    : ImGuiDialog(imgui_drawer),
+      window_(window),
+      config_path_(std::move(config_path)),
+      fps_overlay_(fps_overlay) {
     std::string wm = REXCVAR_GET(window_mode);
     for (int i = 0; i < 3; ++i) {
         if (wm == kWindowModeValues[i]) {
@@ -467,6 +475,17 @@ void DisplaySettingsDialog::OnDraw(ImGuiIO& io) {
     }
 
     ImGui::Separator();
+    {
+        // Read the live state so F1 toggles are reflected here too.
+        bool fps = fps_overlay_ && fps_overlay_->IsVisible();
+        if (ImGui::Checkbox("Show FPS counter (F1)", &fps)) {
+            if (fps_overlay_) {
+                fps_overlay_->SetVisible(fps);
+            }
+            rex::cvar::SetFlagByName("fps_counter", fps ? "true" : "false");
+            rex::cvar::SaveConfig(config_path_);
+        }
+    }
     ImGui::TextDisabled("Internal resolution replaces res_scale.txt.");
     ImGui::TextDisabled("Press F5 to close this menu.");
 

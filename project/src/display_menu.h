@@ -16,6 +16,10 @@
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/window.h>
 
+namespace sr {
+class FpsOverlay;
+}
+
 // Window modes offered by the display menu. kFullscreen changes the monitor's
 // display mode; kBorderless is desktop-mode fullscreen.
 enum class WindowMode { kWindowed = 0, kBorderless = 1, kFullscreen = 2 };
@@ -28,8 +32,9 @@ void ApplyFullscreenDisplayMode(rex::ui::Window* window, int width, int height);
 class DisplaySettingsDialog : public rex::ui::ImGuiDialog {
 public:
     // config_path: where confirmed settings are written (saintsrow.toml).
+    // fps_overlay: the F1 frame-rate counter, toggled from the menu.
     DisplaySettingsDialog(rex::ui::ImGuiDrawer* imgui_drawer, rex::ui::Window* window,
-                          std::filesystem::path config_path);
+                          std::filesystem::path config_path, sr::FpsOverlay* fps_overlay);
     ~DisplaySettingsDialog() override;
 
 protected:
@@ -62,6 +67,7 @@ private:
 
     rex::ui::Window* window_;
     std::filesystem::path config_path_;
+    sr::FpsOverlay* fps_overlay_ = nullptr;
     std::string device_name_;  // Win32 display device (e.g. \\.\DISPLAY1)
 
     std::vector<Mode> modes_;

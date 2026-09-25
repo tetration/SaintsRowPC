@@ -46,6 +46,7 @@ REXCVAR_DECLARE(std::string, input_backend);
 REXCVAR_DECLARE(int32_t, window_width);
 REXCVAR_DECLARE(int32_t, window_height);
 REXCVAR_DECLARE(std::string, window_mode);
+REXCVAR_DECLARE(bool, fps_counter);
 
 #ifdef _WIN32
 #include <windows.h>
@@ -774,9 +775,12 @@ public:
                     display_dialog_.reset();
                 } else {
                     display_dialog_ = std::make_unique<DisplaySettingsDialog>(
-                        imgui_drawer_.get(), window_.get(), config_path_);
+                        imgui_drawer_.get(), window_.get(), config_path_, &fps_overlay_);
                 }
             });
+            if (REXCVAR_GET(fps_counter)) {
+                fps_overlay_.SetVisible(true);
+            }
         } else {
             REXLOG_ERROR("No presenter available to connect to window");
         }
