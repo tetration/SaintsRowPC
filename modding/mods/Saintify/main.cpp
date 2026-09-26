@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -44,6 +45,11 @@ int g_frame = 0;
 int g_converted = 0;
 uint32_t g_next_flee_mode = 4;  // calibrated: 4 = "never cower or flee"
 
+// When enabled, NPCs converted by the player can convert others the same way
+// (close-range hits). Only player-converted NPCs spread it, not every Saint.
+std::unordered_set<uint32_t> g_converted_npcs;  // object addresses
+bool g_spread_enabled = false;                  // menu option, default off
+
 // F3 toggles the mod's menu (like Whompay's trainer); number keys act.
 bool g_enabled = true;
 bool g_menu_open = false;
@@ -60,8 +66,9 @@ void RefreshMenuText() {
            "3) AI field scan (log)\n"
            "4) Snapshot nearest NPC (file)\n"
            "5) Behavior descriptors (file)\n"
+           "6) Converts can convert others: %s\n"
            "converted: %d%s%s",
-           g_enabled ? "ON" : "OFF", g_converted,
+           g_enabled ? "ON" : "OFF", g_spread_enabled ? "ON" : "OFF", g_converted,
            g_action_note.empty() ? "" : "\n", g_action_note.c_str());
   api->overlay_text(text);
 }
@@ -85,29 +92,45 @@ std::unordered_map<uint32_t, ULONGLONG> g_hit_by_player;  // victim -> tick
 int g_hook_log_budget = 20;
 bool g_attribution_proven = false;  // set once the hook sees attacker == player
 
+
 void ConvertNpc(WmlContext* ctx, uint8_t* base, uint32_t obj, uint32_t team, uint32_t player);
 void ConvertLoop(uint32_t player, uint32_t saints_team, bool on_foot);
 bool PlayerOnFoot(uint32_t player);
 float DistanceToPlayer(uint32_t obj, uint32_t player);
+float DistanceBetween(uint32_t a, uint32_t b);
 
 void DamageHook(WmlContext* ctx, uint8_t* base) {
   const uint32_t victim = static_cast<uint32_t>(api->get_r(ctx, 3));
   const uint32_t attacker = static_cast<uint32_t>(api->get_r(ctx, 4));
   const uint32_t player = api->read_u32(kPlayerPtr);
   g_orig_damage_fn(ctx, base);
-  if (!attacker || attacker != player || !victim || victim == player) return;
+  if (!attacker || !victim || victim == player) return;
   if (!g_enabled) return;
   if (api->read_u8(kMpFlag) != 0) return;
   if (api->read_u32(victim + kObjType) != 1) return;       // humans only
   if (api->read_f32(victim + kObjHealth) <= 0.0f) return;  // dead
+  if (!player) return;
   const uint32_t saints_team = api->read_u32(player + kObjTeam);
   if (api->read_u32(victim + kObjTeam) == saints_team) return;  // already a Saint
-  if (!PlayerOnFoot(player)) return;
-  if (DistanceToPlayer(victim, player) > kMeleeRange) return;
-  if (!g_attribution_proven) {
-    g_attribution_proven = true;
-    api->log(self, "player attribution confirmed (attacker == player); enforcing it");
+
+  if (attacker == player) {
+    if (!PlayerOnFoot(player)) return;
+    if (DistanceToPlayer(victim, player) > kMeleeRange) return;
+    if (!g_attribution_proven) {
+      g_attribution_proven = true;
+      api->log(self, "player attribution confirmed (attacker == player); enforcing it");
+    }
+    ConvertNpc(ctx, base, victim, saints_team, player);
+    return;
   }
+
+  // Spread: converted NPCs convert others with close-range hits (menu option,
+  // default off). Only player-converted NPCs spread it, not every Saint.
+  if (!g_spread_enabled) return;
+  if (!g_converted_npcs.count(attacker)) return;
+  if (api->read_u32(attacker + kObjTeam) != saints_team) return;  // sanity
+  if (api->read_u32(attacker + kObjType) != 1) return;            // still a human
+  if (DistanceBetween(victim, attacker) > kMeleeRange) return;
   ConvertNpc(ctx, base, victim, saints_team, player);
 }
 
@@ -135,6 +158,13 @@ float DistanceToPlayer(uint32_t obj, uint32_t player) {
   const float dx = api->read_f32(obj + kObjPos) - api->read_f32(player + kObjPos);
   const float dy = api->read_f32(obj + kObjPos + 4) - api->read_f32(player + kObjPos + 4);
   const float dz = api->read_f32(obj + kObjPos + 8) - api->read_f32(player + kObjPos + 8);
+  return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+float DistanceBetween(uint32_t a, uint32_t b) {
+  const float dx = api->read_f32(a + kObjPos) - api->read_f32(b + kObjPos);
+  const float dy = api->read_f32(a + kObjPos + 4) - api->read_f32(b + kObjPos + 4);
+  const float dz = api->read_f32(a + kObjPos + 8) - api->read_f32(b + kObjPos + 8);
   return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
 
@@ -322,6 +352,8 @@ void OnFrame(void*) {
     } else if (api->key_pressed('5')) {
       DumpBehaviorDescriptors();
       g_action_note = "descriptors written (ai_desc_dump.txt)";
+    } else if (api->key_pressed('6')) {
+      g_spread_enabled = !g_spread_enabled;
     }
     RefreshMenuText();
   }
@@ -391,6 +423,7 @@ void ConvertNpc(WmlContext* ctx, uint8_t* base, uint32_t obj, uint32_t team, uin
   api->write_u32(obj + 2404, 0xFFFFFFFFu);
   api->write_u32(obj + 4200, 0x10);
   ++g_converted;
+  g_converted_npcs.insert(obj);
   char line[224];
   snprintf(line, sizeof(line), "SAINTIFIED object 0x%08X (team %u -> %u, total %d)%s", obj,
            old_team, team, g_converted, ctx ? " +ai reset" : "");
