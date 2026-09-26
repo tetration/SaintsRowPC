@@ -47,6 +47,38 @@ uint32_t g_next_flee_mode = 4;  // calibrated: 4 = "never cower or flee"
 bool g_enabled = true;
 ULONGLONG g_notice_until = 0;
 
+// Hook on sub_82483828: the game's damage/interaction snapshot function
+// (r4 = victim object, r3 = source object). A source equal to the player
+// object means the player dealt the damage. Victims are marked briefly and
+// converted when their health actually drops.
+WmlGuestFunction g_orig_damage_fn = nullptr;
+std::unordered_map<uint32_t, ULONGLONG> g_hit_by_player;  // victim -> tick
+int g_hook_log_budget = 20;
+bool g_attribution_proven = false;  // set once the hook sees src == player
+
+void DamageHook(WmlContext* ctx, uint8_t* base) {
+  const uint32_t source = static_cast<uint32_t>(api->get_r(ctx, 3));
+  const uint32_t victim = static_cast<uint32_t>(api->get_r(ctx, 4));
+  const uint32_t player = api->read_u32(kPlayerPtr);
+  if (g_hook_log_budget > 0 && victim) {
+    --g_hook_log_budget;
+    char line[224];
+    snprintf(line, sizeof(line),
+             "dmg hook: src 0x%08X victim 0x%08X r5 %llu player 0x%08X %s",
+             source, victim, (unsigned long long)api->get_r(ctx, 5), player,
+             source == player ? "<-- PLAYER" : "");
+    api->log(self, line);
+  }
+  if (source && source == player && victim) {
+    g_hit_by_player[victim] = GetTickCount64();
+    if (!g_attribution_proven) {
+      g_attribution_proven = true;
+      api->log(self, "player attribution confirmed (src == player); enforcing it");
+    }
+  }
+  g_orig_damage_fn(ctx, base);
+}
+
 void ToggleEnabled() {
   g_enabled = !g_enabled;
   if (api->size >= sizeof(WmlApi) && api->overlay_text) {
@@ -192,6 +224,17 @@ void OnFrame(void*) {
     it->second = health;
     if (inserted || !on_foot || health >= before - 0.5f) continue;
     if (DistanceToPlayer(obj, player) > kMeleeRange) continue;
+    // Attribution: once the damage hook has proven that its source arg is
+    // the player object, only convert NPCs the player actually damaged
+    // (within the last 1.5 s). Until then, fall back to proximity-only.
+    if (g_attribution_proven) {
+      auto hit = g_hit_by_player.find(obj);
+      if (hit == g_hit_by_player.end() ||
+          GetTickCount64() - hit->second > 1500) {
+        continue;
+      }
+      g_hit_by_player.erase(hit);
+    }
 
     const uint32_t team = api->read_u32(obj + kObjTeam);
     if (team == saints_team) continue;  // already a Saint
@@ -201,15 +244,13 @@ void OnFrame(void*) {
     // 0x08 at obj+3692, combat_enable clears it).
     api->write_u8(obj + kObjCombatFlags, api->read_u8(obj + kObjCombatFlags) & ~0x08u);
     // Cower/flee override: the AI persona (entity+568) keeps the mode at
-    // +3704; 0 = personality default, 1-4 = overrides (set_cower_flee_mode).
-    // Calibration: each conversion tries the next value so the log shows
-    // which one makes civilians fight.
+    // +3704; 0 = personality default. Mode 4 = "never cower or flee"
+    // (calibrated in game).
     const uint32_t ai = api->read_u32(obj + 568);
     uint32_t mode = 0;
     if (ai) {
       mode = g_next_flee_mode;
       api->write_u32(ai + 3704, mode);
-      if (g_next_flee_mode < 4) ++g_next_flee_mode;
     }
     ++g_converted;
     char line[224];
@@ -227,6 +268,9 @@ extern "C" WML_EXPORT int wml_mod_init(const WmlApi* loader_api, const WmlMod* m
   self = mod;
   if (api->version < WML_API_VERSION) return 1;
   api->on_frame(OnFrame, nullptr);
-  api->log(self, "Saintify v5 armed: hit an NPC up close while on foot to convert them. F7 dumps nearby objects.");
+  if (api->hook(0x82483828, DamageHook, &g_orig_damage_fn) != 0) {
+    api->log(self, "WARNING: damage hook failed; player attribution disabled");
+  }
+  api->log(self, "Saintify v6 armed: hit an NPC up close while on foot to convert them. F3 toggles, F7/F8 dump.");
   return 0;
 }
