@@ -43,6 +43,18 @@ int g_frame = 0;
 int g_converted = 0;
 uint32_t g_next_flee_mode = 4;  // calibrated: 4 = "never cower or flee"
 
+// F3 toggles the mod in game (default: enabled); a notice is shown for 2 s.
+bool g_enabled = true;
+ULONGLONG g_notice_until = 0;
+
+void ToggleEnabled() {
+  g_enabled = !g_enabled;
+  if (api->size >= sizeof(WmlApi) && api->overlay_text) {
+    api->overlay_text(g_enabled ? "Saintify: ON (F3)" : "Saintify: OFF (F3)");
+    g_notice_until = GetTickCount64() + 2000;
+  }
+}
+
 bool PlayerOnFoot(uint32_t player) {
   if (api->read_u32(player + 3456) != 0) return false;
   const uint32_t vehicle_handle = api->read_u32(player + 2496);
@@ -140,8 +152,18 @@ void DumpAiFields() {
 }
 
 void OnFrame(void*) {
-  // F7 is edge-triggered (true only the frame the key goes down), so check
-  // it every frame - before the throttle below, or 2 of 3 presses are lost.
+  // F3 toggles the mod; the notice auto-hides after 2 s. Both run every
+  // frame (edge-triggered keys die under the throttle below).
+  if (api->key_pressed(VK_F3)) {
+    ToggleEnabled();
+  }
+  if (g_notice_until && GetTickCount64() > g_notice_until) {
+    g_notice_until = 0;
+    if (api->size >= sizeof(WmlApi) && api->overlay_text) {
+      api->overlay_text("");
+    }
+  }
+  if (!g_enabled) return;
   if (api->key_pressed(VK_F7)) {
     DumpNearbyObjects();
     return;
