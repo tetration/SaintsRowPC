@@ -34,6 +34,7 @@ constexpr int kObjType = 72;      // object+72: type (1 = human, 2/3 = props/cor
 constexpr int kObjTeam = 232;     // object+232: team id (set_team thunk store)
 constexpr int kObjHealth = 1912;  // object+1912: health f32
 constexpr int kObjPos = 20;       // object+20: position vec3f (FirstPerson notes)
+constexpr int kObjCombatFlags = 3692;  // object+3692: bit 0x08 = combat disabled
 
 constexpr float kMeleeRange = 4.5f;
 
@@ -63,32 +64,97 @@ float DistanceToPlayer(uint32_t obj, uint32_t player) {
   return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
 
+void DumpNearbyObjects() {
+  const uint32_t player = api->read_u32(kPlayerPtr);
+  if (!player) return;
+  // The 5 cower/flee mode names from the image (0x821F9588 table).
+  api->log(self, "--- cower/flee mode names ---");
+  for (int i = 0; i < 5; ++i) {
+    const uint32_t str_ptr = api->read_u32(0x821F9588 + i * 4);
+    const char* s = str_ptr ? reinterpret_cast<const char*>(
+                         static_cast<uint8_t*>(api->guest_pointer(str_ptr)))
+                            : nullptr;
+    char line[128];
+    snprintf(line, sizeof(line), "  mode %d = \"%s\"", i, s ? s : "(unreadable)");
+    api->log(self, line);
+  }
+  api->log(self, "--- nearby object dump ---");
+  for (uint32_t index = 0; index < 4096; ++index) {
+    const uint32_t obj = api->read_u32(kObjectTable + 12 + index * 16);
+    if (!obj || obj == player) continue;
+    const float dist = DistanceToPlayer(obj, player);
+    if (dist > 12.0f) continue;
+    char line[320];
+    const uint32_t ai = api->read_u32(obj + 568);  // AI persona sub-object?
+    snprintf(line, sizeof(line),
+             "obj 0x%08X idx %u type %u handle %08X team@232 %d health %.1f "
+             "ai@568 %08X flee@ai+3704 %u dist %.1f",
+             obj, index, api->read_u32(obj + kObjType), api->read_u32(obj + kObjHandle),
+             int32_t(api->read_u32(obj + kObjTeam)), api->read_f32(obj + kObjHealth), ai,
+             ai ? api->read_u32(ai + 3704) : 0xFFFFFFFFu, dist);
+    api->log(self, line);
+  }
+  api->log(self, "--- end dump ---");
+}
+
+// F8: for each nearby human NPC, dump pointer-looking fields in the AI region
+// of the object (+3000..+4200). Fields that are equal within a behavior group
+// (civilians vs gang members) but differ between groups are personality
+// pointer candidates.
+void DumpAiFields() {
+  const uint32_t player = api->read_u32(kPlayerPtr);
+  if (!player) return;
+  api->log(self, "--- AI field scan (nearby humans) ---");
+  for (uint32_t index = 0; index < 4096; ++index) {
+    const uint32_t obj = api->read_u32(kObjectTable + 12 + index * 16);
+    if (!obj || obj == player) continue;
+    if (api->read_u32(obj + kObjType) != 1) continue;
+    if (DistanceToPlayer(obj, player) > 12.0f) continue;
+    char line[320];
+    snprintf(line, sizeof(line), "obj 0x%08X team %d health %.1f:", obj,
+             int32_t(api->read_u32(obj + kObjTeam)), api->read_f32(obj + kObjHealth));
+    api->log(self, line);
+    for (int off = 3000; off <= 4200; off += 4) {
+      const uint32_t v = api->read_u32(obj + off);
+      if (v < 0x82000000 || v >= 0x84160000) continue;  // pointers into image/data only
+      snprintf(line, sizeof(line), "    +%d: 0x%08X", off, v);
+      api->log(self, line);
+    }
+    // The archetype/character definition at +3552: dump every nonzero word so
+    // the personality field can be spotted by comparing archetypes.
+    const uint32_t arch = api->read_u32(obj + 3552);
+    if (arch >= 0x82000000 && arch < 0x84160000) {
+      snprintf(line, sizeof(line), "    archetype 0x%08X:", arch);
+      api->log(self, line);
+      for (int off = 0; off <= 1020; off += 4) {
+        const uint32_t v = api->read_u32(arch + off);
+        if (v != 0) {
+          snprintf(line, sizeof(line), "      +%d: 0x%08X", off, v);
+          api->log(self, line);
+        }
+      }
+    }
+  }
+  api->log(self, "--- end AI field scan ---");
+}
+
 void OnFrame(void*) {
+  // F7 is edge-triggered (true only the frame the key goes down), so check
+  // it every frame - before the throttle below, or 2 of 3 presses are lost.
+  if (api->key_pressed(VK_F7)) {
+    DumpNearbyObjects();
+    return;
+  }
+  if (api->key_pressed(VK_F8)) {
+    DumpAiFields();
+    return;
+  }
   if (++g_frame % 3 != 0) return;
   if (api->read_u8(kMpFlag) != 0) return;  // no converting in multiplayer
   const uint32_t player = api->read_u32(kPlayerPtr);
   if (!player) return;
   const uint32_t saints_team = api->read_u32(player + kObjTeam);
   const bool on_foot = PlayerOnFoot(player);
-
-  // F7: dump nearby objects so we can identify the character type id and
-  // verify the team field (offline calibration).
-  if (api->key_pressed(VK_F7)) {
-    api->log(self, "--- nearby object dump ---");
-    for (uint32_t index = 0; index < 4096; ++index) {
-      const uint32_t obj = api->read_u32(kObjectTable + 12 + index * 16);
-      if (!obj || obj == player) continue;
-      const float dist = DistanceToPlayer(obj, player);
-      if (dist > 12.0f) continue;
-      char line[256];
-      snprintf(line, sizeof(line),
-               "obj 0x%08X idx %u type %u handle %08X team@232 %d health %.1f dist %.1f",
-               obj, index, api->read_u32(obj + kObjType), api->read_u32(obj + kObjHandle),
-               int32_t(api->read_u32(obj + kObjTeam)), api->read_f32(obj + kObjHealth), dist);
-      api->log(self, line);
-    }
-    api->log(self, "--- end dump ---");
-  }
 
   for (uint32_t index = 0; index < 4096; ++index) {
     const uint32_t obj = api->read_u32(kObjectTable + 12 + index * 16);
@@ -108,6 +174,9 @@ void OnFrame(void*) {
     if (team == saints_team) continue;  // already a Saint
 
     api->write_u32(obj + kObjTeam, saints_team);
+    // combat_enable: clear the "combat disabled" bit (combat_disable sets
+    // 0x08 at obj+3692, combat_enable clears it).
+    api->write_u8(obj + kObjCombatFlags, api->read_u8(obj + kObjCombatFlags) & ~0x08u);
     ++g_converted;
     char line[192];
     snprintf(line, sizeof(line), "SAINTIFIED object 0x%08X (team %u -> %u, total %d)", obj,
@@ -123,6 +192,6 @@ extern "C" WML_EXPORT int wml_mod_init(const WmlApi* loader_api, const WmlMod* m
   self = mod;
   if (api->version < WML_API_VERSION) return 1;
   api->on_frame(OnFrame, nullptr);
-  api->log(self, "Saintify v3 armed: hit an NPC up close while on foot to convert them.");
+  api->log(self, "Saintify v5 armed: hit an NPC up close while on foot to convert them. F7 dumps nearby objects.");
   return 0;
 }

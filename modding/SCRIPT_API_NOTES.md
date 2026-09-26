@@ -59,7 +59,9 @@ Objects live in the handle table at `0x830866C8`: `object = read_u32(table +
 | +216 | flags (bit 0x00100000 = invulnerable, player) |
 | +232 | **team id** (write a team id here = set_team; the set_team thunk does exactly `obj+232 = team_id` when team != -1; team name table at 0x820387D8, indexed by team id) |
 | +236 | damage-event counter (increments per hit; see sub_82483828) |
-| +3692 | combat flags byte (combat_enable 0x824C9D18 / combat_disable 0x824C9CD0 read-modify-write it) |
+| +568 | AI persona sub-object pointer (cower/flee mode at persona+3704, see below) |
+| +3552 | **archetype pointer** (character.xtbl entry in memory; the archetype's name is at its +0, e.g. "BF_MID" = black female middle-aged civilian, "HM_3SS3" = hispanic male 3rd Street Saint; personalities like "gang normal" come from here) |
+| +3692 | combat flags byte (bit 0x08 = combat disabled; combat_enable clears it, combat_disable sets it - note: does NOT stop civilians fleeing) |
 | +1912 | health (f32) |
 | +2320 | cash in cents (player) |
 | +2496 | current vehicle handle (player) |
@@ -74,6 +76,45 @@ Los Carnales, Rollerz, Kings, Police, Civilian, Neutral Gang. The team id is
 the runtime index; read it from the player object (`player+232`) rather than
 hardcoding.
 
+## AI behavior: personality, cower/flee, combat
+
+- NPC behavior at spawn is set per human via script fields (seen in mission
+  `.cts` data): `+Team`, `+Personality` ("gang normal", "civilian cowardly",
+  "police swat"), `+Cower/Flee` ("never cower or flee", "always cower when
+  attacked").
+- The **cower/flee mode** is writable at runtime: `set_cower_flee_mode`
+  (0x824DA5D0) maps a mode name (5-entry string table at 0x821F9588) to 0-4
+  and stores it on the AI persona sub-object at **persona+3704**
+  (persona = `entity+568`). This is the per-NPC lever for making a specific
+  NPC brave without touching its archetype.
+- The **archetype** (`entity+3552`) is the parsed character.xtbl entry,
+  SHARED by all NPCs of that type - do not edit it per-NPC. Its name is at
+  archetype+0 (8 bytes): "BF_MID", "BM_YNG", "HM_3SS3" (3rd Street Saints).
+- `combat_enable`/`combat_disable` only toggle bit 0x08 at entity+3692;
+  insufficient to stop personality-driven fleeing.
+
+## Spawning (from Living Stilwater, useful for spawn-peds/zombie mods)
+
+| Address | Purpose |
+|---|---|
+| 0x82412298 | FIND_SPAWN_SPOTS (r7 = allow-in-view, r22 = on-screen count) |
+| 0x82411310 | spawns a car at a spot, r3 = vehicle on return |
+| 0x824194A8 | TRAFFIC_WANTED (target car count) |
+| 0x82419208 | PEDS_WANTED (target ped count) |
+| 0x8240DB70 | PEDS_COUNT |
+| 0x8309A1C0 | TRAFFIC_COUNT |
+| 0x827AD060 / 0x827AD064 | traffic / ped density floats |
+| 0x82832724 | TRAFFIC_RADIUS |
+| 0x83710238 | total vehicle count |
+| hardcoded limits | 26 ambient peds, 75 characters total, 12 traffic cars |
+
+Character archetypes (360) and AI personalities live in character.xtbl /
+ai_personalities.xtbl (compiled binary inside misc.vpp_xbox2; the spawn_info
+group/category files are plain text and editable with a patch.lua - see
+Living Stilwater).
+
+
+| Address | Meaning |
 ## Other addresses
 
 | Address | Meaning |
