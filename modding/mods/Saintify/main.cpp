@@ -56,26 +56,30 @@ std::unordered_map<uint32_t, ULONGLONG> g_hit_by_player;  // victim -> tick
 int g_hook_log_budget = 20;
 bool g_attribution_proven = false;  // set once the hook sees attacker == player
 
+void ConvertNpc(WmlContext* ctx, uint8_t* base, uint32_t obj, uint32_t team, uint32_t player);
+void ConvertLoop(uint32_t player, uint32_t saints_team, bool on_foot);
+bool PlayerOnFoot(uint32_t player);
+float DistanceToPlayer(uint32_t obj, uint32_t player);
+
 void DamageHook(WmlContext* ctx, uint8_t* base) {
   const uint32_t victim = static_cast<uint32_t>(api->get_r(ctx, 3));
   const uint32_t attacker = static_cast<uint32_t>(api->get_r(ctx, 4));
   const uint32_t player = api->read_u32(kPlayerPtr);
-  if (g_hook_log_budget > 0 && victim) {
-    --g_hook_log_budget;
-    char line[224];
-    snprintf(line, sizeof(line),
-             "dmg hook: victim 0x%08X attacker 0x%08X player 0x%08X %s",
-             victim, attacker, player, attacker == player ? "<-- PLAYER" : "");
-    api->log(self, line);
-  }
-  if (attacker && attacker == player && victim) {
-    g_hit_by_player[victim] = GetTickCount64();
-    if (!g_attribution_proven) {
-      g_attribution_proven = true;
-      api->log(self, "player attribution confirmed (attacker == player); enforcing it");
-    }
-  }
   g_orig_damage_fn(ctx, base);
+  if (!attacker || attacker != player || !victim || victim == player) return;
+  if (!g_enabled) return;
+  if (api->read_u8(kMpFlag) != 0) return;
+  if (api->read_u32(victim + kObjType) != 1) return;       // humans only
+  if (api->read_f32(victim + kObjHealth) <= 0.0f) return;  // dead
+  const uint32_t saints_team = api->read_u32(player + kObjTeam);
+  if (api->read_u32(victim + kObjTeam) == saints_team) return;  // already a Saint
+  if (!PlayerOnFoot(player)) return;
+  if (DistanceToPlayer(victim, player) > kMeleeRange) return;
+  if (!g_attribution_proven) {
+    g_attribution_proven = true;
+    api->log(self, "player attribution confirmed (attacker == player); enforcing it");
+  }
+  ConvertNpc(ctx, base, victim, saints_team, player);
 }
 
 void ToggleEnabled() {
@@ -141,6 +145,53 @@ void DumpNearbyObjects() {
   api->log(self, "--- end dump ---");
 }
 
+// F9: snapshot the nearest NPC's entity and AI persona memory to a file, so
+// two snapshots (e.g. before and after recruit+dismiss) can be diffed offline
+// to find exactly which fields the game changes.
+int g_snapshot_num = 0;
+
+void SnapshotNearestNpc() {
+  const uint32_t player = api->read_u32(kPlayerPtr);
+  if (!player) return;
+  uint32_t best = 0;
+  float best_dist = 1e9f;
+  for (uint32_t index = 0; index < 4096; ++index) {
+    const uint32_t obj = api->read_u32(kObjectTable + 12 + index * 16);
+    if (!obj || obj == player) continue;
+    if (api->read_u32(obj + kObjType) != 1) continue;
+    const float d = DistanceToPlayer(obj, player);
+    if (d < best_dist) {
+      best_dist = d;
+      best = obj;
+    }
+  }
+  if (!best) {
+    api->log(self, "snapshot: no NPC nearby");
+    return;
+  }
+  char path[520];
+  snprintf(path, sizeof(path), "%s\\..\\npc_snap_%d.txt", self->folder, g_snapshot_num++);
+  FILE* f = fopen(path, "w");
+  if (!f) return;
+  const uint32_t ai = api->read_u32(best + 568);
+  fprintf(f, "obj 0x%08X ai 0x%08X\n", best, ai);
+  for (int off = 0; off <= 4200; off += 4) {
+    const uint32_t v = api->read_u32(best + off);
+    if (v) fprintf(f, "obj +%-5d 0x%08X\n", off, v);
+  }
+  if (ai) {
+    for (int off = 0; off <= 4200; off += 4) {
+      const uint32_t v = api->read_u32(ai + off);
+      if (v) fprintf(f, "ai  +%-5d 0x%08X\n", off, v);
+    }
+  }
+  fclose(f);
+  char line[160];
+  snprintf(line, sizeof(line), "snapshot %d written for obj 0x%08X (dist %.1f)",
+           g_snapshot_num - 1, best, best_dist);
+  api->log(self, line);
+}
+
 // F8: for each nearby human NPC, dump pointer-looking fields in the AI region
 // of the object (+3000..+4200). Fields that are equal within a behavior group
 // (civilians vs gang members) but differ between groups are personality
@@ -203,13 +254,80 @@ void OnFrame(void*) {
     DumpAiFields();
     return;
   }
+  if (api->key_pressed(VK_F9)) {
+    SnapshotNearestNpc();
+    return;
+  }
   if (++g_frame % 3 != 0) return;
   if (api->read_u8(kMpFlag) != 0) return;  // no converting in multiplayer
   const uint32_t player = api->read_u32(kPlayerPtr);
   if (!player) return;
   const uint32_t saints_team = api->read_u32(player + kObjTeam);
   const bool on_foot = PlayerOnFoot(player);
+  ConvertLoop(player, saints_team, on_foot);
+}
+// Applies the full conversion to an NPC object. When called from the damage
+// hook (ctx != nullptr) the NPC's AI state is also reset to idle via
+// sub_8257C400(obj, 19) - the core of npc_go_idle - so an in-flight flee
+// action is cancelled and the brain re-evaluates with the new settings.
+void ConvertNpc(WmlContext* ctx, uint8_t* base, uint32_t obj, uint32_t team, uint32_t player) {
+  const uint32_t old_team = api->read_u32(obj + kObjTeam);
+  api->write_u32(obj + kObjTeam, team);
+  // combat_enable: clear the "combat disabled" bit (combat_disable sets
+  // 0x08 at obj+3692, combat_enable clears it).
+  api->write_u8(obj + kObjCombatFlags, api->read_u8(obj + kObjCombatFlags) & ~0x08u);
+  // Cower/flee override: the AI persona (entity+568) keeps the mode at
+  // +3704; 0 = personality default. Mode 4 = "never cower or flee"
+  // (calibrated in game).
+  const uint32_t ai = api->read_u32(obj + 568);
+  if (ai) {
+    api->write_u32(ai + 3704, g_next_flee_mode);
+  } else {
+    char note[128];
+    snprintf(note, sizeof(note), "  note: obj 0x%08X has no AI persona (+568 null)", obj);
+    api->log(self, note);
+  }
+  // Recruit/dismiss leaves an ex-civilian combat-ready; the snapshot diff
+  // showed these entity fields change during that cycle. Replicate them.
+  const uint32_t flags = api->read_u32(obj + 216);
+  api->write_u32(obj + 216, flags & ~0x04000000u);
+  api->write_u32(obj + 512, 1);
+  api->write_u32(obj + 3568, 2);
+  api->write_u32(obj + 3972, 1);
+  // Leader links the recruit cycle wrote (is_in_party reads a leader handle
+  // via the inner object; gunshot panic is suppressed for the leader's
+  // party). Dismissed NPCs keep these without following.
+  const uint32_t player_handle = api->read_u32(player + kObjHandle);
+  api->write_u32(obj + 1128, player_handle);
+  api->write_u32(obj + 1176, player_handle);
+  api->write_u32(obj + 3976, player_handle);
+  // Remaining recruit/dismiss changes from the snapshot diff: cleared
+  // target/goal handles and one mode field.
+  api->write_u32(obj + 292, 0xFFFFFFFFu);
+  api->write_u32(obj + 772, 0xFFFFFFFFu);
+  api->write_u32(obj + 776, 0xFFFFFFFFu);
+  api->write_u32(obj + 2404, 0xFFFFFFFFu);
+  api->write_u32(obj + 4200, 0x10);
+  ++g_converted;
+  char line[224];
+  snprintf(line, sizeof(line), "SAINTIFIED object 0x%08X (team %u -> %u, total %d)%s", obj,
+           old_team, team, g_converted, ctx ? " +ai reset" : "");
+  api->log(self, line);
+  if (ctx) {
+    const uint64_t saved_r3 = api->get_r(ctx, 3);
+    const uint64_t saved_r4 = api->get_r(ctx, 4);
+    // AI state switch to 19 (the core of npc_go_idle, sub_8257C400). The
+    // other calls in npc_go_idle (action cancel / brain reset) scrambled
+    // converted NPCs, so only the state switch is kept.
+    api->set_r(ctx, 3, obj);
+    api->set_r(ctx, 4, 19);
+    api->call(ctx, 0x8257C400);
+    api->set_r(ctx, 3, saved_r3);
+    api->set_r(ctx, 4, saved_r4);
+  }
+}
 
+void ConvertLoop(uint32_t player, uint32_t saints_team, bool on_foot) {
   for (uint32_t index = 0; index < 4096; ++index) {
     const uint32_t obj = api->read_u32(kObjectTable + 12 + index * 16);
     if (!obj || obj == player) continue;
@@ -223,7 +341,7 @@ void OnFrame(void*) {
     it->second = health;
     if (inserted || !on_foot || health >= before - 0.5f) continue;
     if (DistanceToPlayer(obj, player) > kMeleeRange) continue;
-    // Attribution: once the damage hook has proven that its source arg is
+    // Attribution: once the damage hook has proven that its attacker arg is
     // the player object, only convert NPCs the player actually damaged
     // (within the last 1.5 s). Until then, fall back to proximity-only.
     if (g_attribution_proven) {
@@ -237,26 +355,7 @@ void OnFrame(void*) {
 
     const uint32_t team = api->read_u32(obj + kObjTeam);
     if (team == saints_team) continue;  // already a Saint
-
-    api->write_u32(obj + kObjTeam, saints_team);
-    // combat_enable: clear the "combat disabled" bit (combat_disable sets
-    // 0x08 at obj+3692, combat_enable clears it).
-    api->write_u8(obj + kObjCombatFlags, api->read_u8(obj + kObjCombatFlags) & ~0x08u);
-    // Cower/flee override: the AI persona (entity+568) keeps the mode at
-    // +3704; 0 = personality default. Mode 4 = "never cower or flee"
-    // (calibrated in game).
-    const uint32_t ai = api->read_u32(obj + 568);
-    uint32_t mode = 0;
-    if (ai) {
-      mode = g_next_flee_mode;
-      api->write_u32(ai + 3704, mode);
-    }
-    ++g_converted;
-    char line[224];
-    snprintf(line, sizeof(line),
-             "SAINTIFIED object 0x%08X (team %u -> %u, flee mode %u, total %d)", obj, team,
-             saints_team, mode, g_converted);
-    api->log(self, line);
+    ConvertNpc(nullptr, nullptr, obj, saints_team, player);
   }
 }
 
