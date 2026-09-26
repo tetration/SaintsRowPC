@@ -53,7 +53,7 @@ Objects live in the handle table at `0x830866C8`: `object = read_u32(table +
 | Offset | Field |
 |---|---|
 | +68 | handle (full, incl. generation) |
-| +72 | object type (1 = player, 5 = vehicle; human NPC type TBD) |
+| +72 | object type (1 = **any human, incl. the player**; 2/3 = props/corpses, health 0; 5 = vehicle) |
 | +212 | dirty flag (player) |
 | +216 | flags (bit 0x00100000 = invulnerable, player) |
 | +232 | **team id** (write a team id here = set_team; the set_team thunk does exactly `obj+232 = team_id` when team != -1) |
