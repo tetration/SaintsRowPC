@@ -52,11 +52,14 @@ Objects live in the handle table at `0x830866C8`: `object = read_u32(table +
 
 | Offset | Field |
 |---|---|
+| +20 | position (vec3f, all objects) |
 | +68 | handle (full, incl. generation) |
 | +72 | object type (1 = **any human, incl. the player**; 2/3 = props/corpses, health 0; 5 = vehicle) |
 | +212 | dirty flag (player) |
 | +216 | flags (bit 0x00100000 = invulnerable, player) |
-| +232 | **team id** (write a team id here = set_team; the set_team thunk does exactly `obj+232 = team_id` when team != -1) |
+| +232 | **team id** (write a team id here = set_team; the set_team thunk does exactly `obj+232 = team_id` when team != -1; team name table at 0x820387D8, indexed by team id) |
+| +236 | damage-event counter (increments per hit; see sub_82483828) |
+| +3692 | combat flags byte (combat_enable 0x824C9D18 / combat_disable 0x824C9CD0 read-modify-write it) |
 | +1912 | health (f32) |
 | +2320 | cash in cents (player) |
 | +2496 | current vehicle handle (player) |
