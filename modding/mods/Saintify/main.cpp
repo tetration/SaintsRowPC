@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <string>
 #include <unordered_map>
 
 #define WIN32_LEAN_AND_MEAN
@@ -43,9 +44,37 @@ int g_frame = 0;
 int g_converted = 0;
 uint32_t g_next_flee_mode = 4;  // calibrated: 4 = "never cower or flee"
 
-// F3 toggles the mod in game (default: enabled); a notice is shown for 2 s.
+// F3 toggles the mod's menu (like Whompay's trainer); number keys act.
 bool g_enabled = true;
-ULONGLONG g_notice_until = 0;
+bool g_menu_open = false;
+std::string g_action_note;
+
+void RefreshMenuText() {
+  if (!g_menu_open) return;
+  if (api->size < sizeof(WmlApi) || !api->overlay_text) return;
+  char text[512];
+  snprintf(text, sizeof(text),
+           "Saintify (F3 close)\n"
+           "1) Enabled: %s\n"
+           "2) Dump nearby objects (log)\n"
+           "3) AI field scan (log)\n"
+           "4) Snapshot nearest NPC (file)\n"
+           "5) Behavior descriptors (file)\n"
+           "converted: %d%s%s",
+           g_enabled ? "ON" : "OFF", g_converted,
+           g_action_note.empty() ? "" : "\n", g_action_note.c_str());
+  api->overlay_text(text);
+}
+
+void ToggleMenu() {
+  g_menu_open = !g_menu_open;
+  g_action_note.clear();
+  if (g_menu_open) {
+    RefreshMenuText();
+  } else if (api->size >= sizeof(WmlApi) && api->overlay_text) {
+    api->overlay_text("");
+  }
+}
 
 // Hook on sub_824470D0: the character damage function (r3 = victim object,
 // r4 = attacker object; identified by hook-testing every function that
@@ -84,10 +113,7 @@ void DamageHook(WmlContext* ctx, uint8_t* base) {
 
 void ToggleEnabled() {
   g_enabled = !g_enabled;
-  if (api->size >= sizeof(WmlApi) && api->overlay_text) {
-    api->overlay_text(g_enabled ? "Saintify: ON (F3)" : "Saintify: OFF (F3)");
-    g_notice_until = GetTickCount64() + 2000;
-  }
+  RefreshMenuText();
 }
 
 bool PlayerOnFoot(uint32_t player) {
@@ -277,34 +303,29 @@ void DumpAiFields() {
 }
 
 void OnFrame(void*) {
-  // F3 toggles the mod; the notice auto-hides after 2 s. Both run every
-  // frame (edge-triggered keys die under the throttle below).
+  // F3 opens/closes the menu; number keys run the actions while it's open.
   if (api->key_pressed(VK_F3)) {
-    ToggleEnabled();
+    ToggleMenu();
   }
-  if (g_notice_until && GetTickCount64() > g_notice_until) {
-    g_notice_until = 0;
-    if (api->size >= sizeof(WmlApi) && api->overlay_text) {
-      api->overlay_text("");
+  if (g_menu_open) {
+    if (api->key_pressed('1')) {
+      ToggleEnabled();
+    } else if (api->key_pressed('2')) {
+      DumpNearbyObjects();
+      g_action_note = "objects dumped to wml.log";
+    } else if (api->key_pressed('3')) {
+      DumpAiFields();
+      g_action_note = "AI fields dumped to wml.log";
+    } else if (api->key_pressed('4')) {
+      SnapshotNearestNpc();
+      g_action_note = "snapshot written (npc_snap_N.txt)";
+    } else if (api->key_pressed('5')) {
+      DumpBehaviorDescriptors();
+      g_action_note = "descriptors written (ai_desc_dump.txt)";
     }
+    RefreshMenuText();
   }
   if (!g_enabled) return;
-  if (api->key_pressed(VK_F7)) {
-    DumpNearbyObjects();
-    return;
-  }
-  if (api->key_pressed(VK_F8)) {
-    DumpAiFields();
-    return;
-  }
-  if (api->key_pressed(VK_F9)) {
-    SnapshotNearestNpc();
-    return;
-  }
-  if (api->key_pressed(VK_F12)) {
-    DumpBehaviorDescriptors();
-    return;
-  }
   if (++g_frame % 3 != 0) return;
   if (api->read_u8(kMpFlag) != 0) return;  // no converting in multiplayer
   const uint32_t player = api->read_u32(kPlayerPtr);
@@ -320,6 +341,7 @@ void OnFrame(void*) {
 void ConvertNpc(WmlContext* ctx, uint8_t* base, uint32_t obj, uint32_t team, uint32_t player) {
   const uint32_t old_team = api->read_u32(obj + kObjTeam);
   api->write_u32(obj + kObjTeam, team);
+  const uint32_t player_handle = api->read_u32(player + kObjHandle);
   // combat_enable: clear the "combat disabled" bit (combat_disable sets
   // 0x08 at obj+3692, combat_enable clears it).
   api->write_u8(obj + kObjCombatFlags, api->read_u8(obj + kObjCombatFlags) & ~0x08u);
@@ -339,6 +361,10 @@ void ConvertNpc(WmlContext* ctx, uint8_t* base, uint32_t obj, uint32_t team, uin
       snprintf(note, sizeof(note), "  behavior node 0x%08X -> 0x82C06D70", behavior);
       api->log(self, note);
     }
+    // Party-leader handle on the persona: is_in_party (0x824D05E0) compares
+    // this against the player's handle; party members don't panic at
+    // gunfire. Written by the recruit cycle, kept after dismiss.
+    api->write_u32(ai + 4128, player_handle);
   } else {
     char note[128];
     snprintf(note, sizeof(note), "  note: obj 0x%08X has no AI persona (+568 null)", obj);
@@ -354,7 +380,6 @@ void ConvertNpc(WmlContext* ctx, uint8_t* base, uint32_t obj, uint32_t team, uin
   // Leader links the recruit cycle wrote (is_in_party reads a leader handle
   // via the inner object; gunshot panic is suppressed for the leader's
   // party). Dismissed NPCs keep these without following.
-  const uint32_t player_handle = api->read_u32(player + kObjHandle);
   api->write_u32(obj + 1128, player_handle);
   api->write_u32(obj + 1176, player_handle);
   api->write_u32(obj + 3976, player_handle);
