@@ -30,7 +30,7 @@ constexpr uint32_t kObjectTable = 0x830866C8;  // object = +12 + index*16
 constexpr uint32_t kMpFlag = 0x8370E9F6;
 
 constexpr int kObjHandle = 68;    // object+68: handle
-constexpr int kObjType = 72;      // object+72: type (1 = player, 5 = vehicle)
+constexpr int kObjType = 72;      // object+72: type (1 = human, 2/3 = props/corpses, 5 = vehicle)
 constexpr int kObjTeam = 232;     // object+232: team id (set_team thunk store)
 constexpr int kObjHealth = 1912;  // object+1912: health f32
 constexpr int kObjPos = 20;       // object+20: position vec3f (FirstPerson notes)
@@ -71,11 +71,30 @@ void OnFrame(void*) {
   const uint32_t saints_team = api->read_u32(player + kObjTeam);
   const bool on_foot = PlayerOnFoot(player);
 
+  // F7: dump nearby objects so we can identify the character type id and
+  // verify the team field (offline calibration).
+  if (api->key_pressed(VK_F7)) {
+    api->log(self, "--- nearby object dump ---");
+    for (uint32_t index = 0; index < 4096; ++index) {
+      const uint32_t obj = api->read_u32(kObjectTable + 12 + index * 16);
+      if (!obj || obj == player) continue;
+      const float dist = DistanceToPlayer(obj, player);
+      if (dist > 12.0f) continue;
+      char line[256];
+      snprintf(line, sizeof(line),
+               "obj 0x%08X idx %u type %u handle %08X team@232 %d health %.1f dist %.1f",
+               obj, index, api->read_u32(obj + kObjType), api->read_u32(obj + kObjHandle),
+               int32_t(api->read_u32(obj + kObjTeam)), api->read_f32(obj + kObjHealth), dist);
+      api->log(self, line);
+    }
+    api->log(self, "--- end dump ---");
+  }
+
   for (uint32_t index = 0; index < 4096; ++index) {
     const uint32_t obj = api->read_u32(kObjectTable + 12 + index * 16);
     if (!obj || obj == player) continue;
-    const uint32_t type = api->read_u32(obj + kObjType);
-    if (type == 1 || type == 5) continue;  // player / vehicle
+    // Only humans (type 1; that includes the player, excluded above).
+    if (api->read_u32(obj + kObjType) != 1) continue;
     const float health = api->read_f32(obj + kObjHealth);
     if (health <= 0.0f) continue;  // dead
 
