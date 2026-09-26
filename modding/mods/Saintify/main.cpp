@@ -50,6 +50,14 @@ uint32_t g_next_flee_mode = 4;  // calibrated: 4 = "never cower or flee"
 std::unordered_set<uint32_t> g_converted_npcs;  // object addresses
 bool g_spread_enabled = false;                  // menu option, default off
 
+// Behavior node source for converts (menu option 6 cycles):
+// 0 = copy from a nearby gang/police NPC, 1 = combatant node (default),
+// 2/3 = the other known nodes (0x82C06D7C / 0x82C06E0C, for experiments).
+int g_node_mode = 1;
+constexpr uint32_t kKnownNodes[] = {0, 0x82C06D70, 0x82C06D7C, 0x82C06E0C};
+const char* kNodeModeNames[] = {"nearby gang NPC", "combatant (0x82C06D70)",
+                                "node 0x82C06D7C", "node 0x82C06E0C"};
+
 // F3 toggles the mod's menu (like Whompay's trainer); number keys act.
 bool g_enabled = true;
 bool g_menu_open = false;
@@ -67,8 +75,10 @@ void RefreshMenuText() {
            "4) Snapshot nearest NPC (file)\n"
            "5) Behavior descriptors (file)\n"
            "6) Converts can convert others: %s\n"
+           "7) Behavior node: %s\n"
            "converted: %d%s%s",
-           g_enabled ? "ON" : "OFF", g_spread_enabled ? "ON" : "OFF", g_converted,
+           g_enabled ? "ON" : "OFF", g_spread_enabled ? "ON" : "OFF",
+           kNodeModeNames[g_node_mode], g_converted,
            g_action_note.empty() ? "" : "\n", g_action_note.c_str());
   api->overlay_text(text);
 }
@@ -98,6 +108,7 @@ void ConvertLoop(uint32_t player, uint32_t saints_team, bool on_foot);
 bool PlayerOnFoot(uint32_t player);
 float DistanceToPlayer(uint32_t obj, uint32_t player);
 float DistanceBetween(uint32_t a, uint32_t b);
+uint32_t FindGangBehaviorNode(uint32_t player);
 
 void DamageHook(WmlContext* ctx, uint8_t* base) {
   const uint32_t victim = static_cast<uint32_t>(api->get_r(ctx, 3));
@@ -166,6 +177,26 @@ float DistanceBetween(uint32_t a, uint32_t b) {
   const float dy = api->read_f32(a + kObjPos + 4) - api->read_f32(b + kObjPos + 4);
   const float dz = api->read_f32(a + kObjPos + 8) - api->read_f32(b + kObjPos + 8);
   return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+// Finds the behavior node of a nearby gang/police NPC (team 1-5: Vice Lords,
+// Los Carnales, Rollerz, Kings, Police) to copy onto a converted NPC, so
+// converts get a male gang combat style rather than a fixed (possibly female)
+// node. Returns 0 if none is nearby.
+uint32_t FindGangBehaviorNode(uint32_t player) {
+  for (uint32_t index = 0; index < 4096; ++index) {
+    const uint32_t obj = api->read_u32(kObjectTable + 12 + index * 16);
+    if (!obj || obj == player) continue;
+    if (api->read_u32(obj + kObjType) != 1) continue;
+    const uint32_t team = api->read_u32(obj + kObjTeam);
+    if (team == 0 || team >= 6) continue;  // skip Saints and civilians
+    if (DistanceToPlayer(obj, player) > 60.0f) continue;
+    const uint32_t ai = api->read_u32(obj + 568);
+    if (!ai) continue;
+    const uint32_t node = api->read_u32(ai + 3748);
+    if (node) return node;
+  }
+  return 0;
 }
 
 void DumpNearbyObjects() {
@@ -354,6 +385,8 @@ void OnFrame(void*) {
       g_action_note = "descriptors written (ai_desc_dump.txt)";
     } else if (api->key_pressed('6')) {
       g_spread_enabled = !g_spread_enabled;
+    } else if (api->key_pressed('7')) {
+      g_node_mode = (g_node_mode + 1) % 4;
     }
     RefreshMenuText();
   }
@@ -384,13 +417,21 @@ void ConvertNpc(WmlContext* ctx, uint8_t* base, uint32_t obj, uint32_t team, uin
   if (ai) {
     api->write_u32(ai + 3704, g_next_flee_mode);
     // Behavior node swap: ai+3748 points into the AI behavior list (nodes
-    // with function pointers at 0x82BE16xx). The recruit/dismiss cycle moved
-    // it from 0x82C06D7C to the combatant node 0x82C06D70.
+    // with function pointers at 0x82BE16xx). Source is menu-selectable:
+    // copy from a nearby gang/police NPC, or a fixed node (default: the
+    // combatant node from the recruit/dismiss diff).
     const uint32_t behavior = api->read_u32(ai + 3748);
-    if (behavior != 0x82C06D70u) {
-      api->write_u32(ai + 3748, 0x82C06D70u);
+    uint32_t gang_node = 0;
+    if (g_node_mode == 0) {
+      gang_node = FindGangBehaviorNode(player);
+    }
+    const uint32_t target =
+        gang_node ? gang_node : kKnownNodes[g_node_mode == 0 ? 1 : g_node_mode];
+    if (behavior != target) {
+      api->write_u32(ai + 3748, target);
       char note[128];
-      snprintf(note, sizeof(note), "  behavior node 0x%08X -> 0x82C06D70", behavior);
+      snprintf(note, sizeof(note), "  behavior node 0x%08X -> 0x%08X (%s)", behavior, target,
+               kNodeModeNames[g_node_mode]);
       api->log(self, note);
     }
     // Party-leader handle on the persona: is_in_party (0x824D05E0) compares
@@ -429,16 +470,21 @@ void ConvertNpc(WmlContext* ctx, uint8_t* base, uint32_t obj, uint32_t team, uin
            old_team, team, g_converted, ctx ? " +ai reset" : "");
   api->log(self, line);
   if (ctx) {
-    const uint64_t saved_r3 = api->get_r(ctx, 3);
-    const uint64_t saved_r4 = api->get_r(ctx, 4);
-    // AI state switch to 19 (the core of npc_go_idle, sub_8257C400). The
-    // other calls in npc_go_idle (action cancel / brain reset) scrambled
-    // converted NPCs, so only the state switch is kept.
-    api->set_r(ctx, 3, obj);
-    api->set_r(ctx, 4, 19);
-    api->call(ctx, 0x8257C400);
-    api->set_r(ctx, 3, saved_r3);
-    api->set_r(ctx, 4, saved_r4);
+    // AI state switch to 19 (the core of npc_go_idle, sub_8257C400), with the
+    // game's own guards: npc_go_idle only switches when the NPC is not in a
+    // vehicle state (508 != 9) and its sub-state (+2556) is 1 or 3. Forcing it
+    // outside those states gave converts a wrong locomotion set ("girl run").
+    const uint32_t state = api->read_u32(obj + 508);
+    const uint32_t sub_state = api->read_u32(obj + 2556);
+    if (state != 9 && (sub_state == 1 || sub_state == 3)) {
+      const uint64_t saved_r3 = api->get_r(ctx, 3);
+      const uint64_t saved_r4 = api->get_r(ctx, 4);
+      api->set_r(ctx, 3, obj);
+      api->set_r(ctx, 4, 19);
+      api->call(ctx, 0x8257C400);
+      api->set_r(ctx, 3, saved_r3);
+      api->set_r(ctx, 4, saved_r4);
+    }
   }
 }
 
