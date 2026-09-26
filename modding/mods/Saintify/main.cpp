@@ -41,6 +41,7 @@ constexpr float kMeleeRange = 4.5f;
 std::unordered_map<uint32_t, float> g_health;  // object -> last seen health
 int g_frame = 0;
 int g_converted = 0;
+uint32_t g_next_flee_mode = 4;  // calibrated: 4 = "never cower or flee"
 
 bool PlayerOnFoot(uint32_t player) {
   if (api->read_u32(player + 3456) != 0) return false;
@@ -177,10 +178,22 @@ void OnFrame(void*) {
     // combat_enable: clear the "combat disabled" bit (combat_disable sets
     // 0x08 at obj+3692, combat_enable clears it).
     api->write_u8(obj + kObjCombatFlags, api->read_u8(obj + kObjCombatFlags) & ~0x08u);
+    // Cower/flee override: the AI persona (entity+568) keeps the mode at
+    // +3704; 0 = personality default, 1-4 = overrides (set_cower_flee_mode).
+    // Calibration: each conversion tries the next value so the log shows
+    // which one makes civilians fight.
+    const uint32_t ai = api->read_u32(obj + 568);
+    uint32_t mode = 0;
+    if (ai) {
+      mode = g_next_flee_mode;
+      api->write_u32(ai + 3704, mode);
+      if (g_next_flee_mode < 4) ++g_next_flee_mode;
+    }
     ++g_converted;
-    char line[192];
-    snprintf(line, sizeof(line), "SAINTIFIED object 0x%08X (team %u -> %u, total %d)", obj,
-             team, saints_team, g_converted);
+    char line[224];
+    snprintf(line, sizeof(line),
+             "SAINTIFIED object 0x%08X (team %u -> %u, flee mode %u, total %d)", obj, team,
+             saints_team, mode, g_converted);
     api->log(self, line);
   }
 }

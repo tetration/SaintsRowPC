@@ -85,8 +85,9 @@ hardcoding.
 - The **cower/flee mode** is writable at runtime: `set_cower_flee_mode`
   (0x824DA5D0) maps a mode name (5-entry string table at 0x821F9588) to 0-4
   and stores it on the AI persona sub-object at **persona+3704**
-  (persona = `entity+568`). This is the per-NPC lever for making a specific
-  NPC brave without touching its archetype.
+  (persona = `entity+568`). **Mode 4 = "never cower or flee"** (calibrated in
+  game: converted civilians with mode 4 stopped fleeing and fought back).
+  0 = use the personality default (what all ambient NPCs have).
 - The **archetype** (`entity+3552`) is the parsed character.xtbl entry,
   SHARED by all NPCs of that type - do not edit it per-NPC. Its name is at
   archetype+0 (8 bytes): "BF_MID", "BM_YNG", "HM_3SS3" (3rd Street Saints).
