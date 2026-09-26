@@ -192,6 +192,49 @@ void SnapshotNearestNpc() {
   api->log(self, line);
 }
 
+// F12: dump the AI behavior descriptor table region (around the entries seen
+// in the recruit/dismiss diff) plus the current descriptors of the nearest
+// NPCs, to a file for offline analysis.
+void DumpBehaviorDescriptors() {
+  const uint32_t player = api->read_u32(kPlayerPtr);
+  if (!player) return;
+  char path[520];
+  snprintf(path, sizeof(path), "%s\\..\\ai_desc_dump.txt", self->folder);
+  FILE* f = fopen(path, "w");
+  if (!f) return;
+
+  // Region covering the descriptor entries seen so far.
+  fprintf(f, "== table region 0x829E3800..0x829E4600 ==\n");
+  for (uint32_t a = 0x829E3800; a < 0x829E4600; a += 4) {
+    const uint32_t v = api->read_u32(a);
+    if (v) fprintf(f, "0x%08X: 0x%08X\n", a, v);
+  }
+  // Nearest NPCs: their descriptor pointers and descriptor contents.
+  fprintf(f, "== nearby NPC descriptors ==\n");
+  for (uint32_t index = 0; index < 4096; ++index) {
+    const uint32_t obj = api->read_u32(kObjectTable + 12 + index * 16);
+    if (!obj || obj == player) continue;
+    if (api->read_u32(obj + kObjType) != 1) continue;
+    if (DistanceToPlayer(obj, player) > 15.0f) continue;
+    const uint32_t ai = api->read_u32(obj + 568);
+    if (!ai) continue;
+    const uint32_t d1 = api->read_u32(ai + 3616);
+    const uint32_t d2 = api->read_u32(ai + 3748);
+    fprintf(f, "npc 0x%08X team %d: ai+3616 = 0x%08X, ai+3748 = 0x%08X\n", obj,
+            int32_t(api->read_u32(obj + kObjTeam)), d1, d2);
+    for (uint32_t d : {d1, d2}) {
+      if (!d) continue;
+      fprintf(f, "  descriptor 0x%08X:", d);
+      for (int off = 0; off <= 60; off += 4) {
+        fprintf(f, " %+d=0x%08X", off, api->read_u32(d + off));
+      }
+      fprintf(f, "\n");
+    }
+  }
+  fclose(f);
+  api->log(self, "AI descriptor dump written to mods\\ai_desc_dump.txt");
+}
+
 // F8: for each nearby human NPC, dump pointer-looking fields in the AI region
 // of the object (+3000..+4200). Fields that are equal within a behavior group
 // (civilians vs gang members) but differ between groups are personality
@@ -258,6 +301,10 @@ void OnFrame(void*) {
     SnapshotNearestNpc();
     return;
   }
+  if (api->key_pressed(VK_F12)) {
+    DumpBehaviorDescriptors();
+    return;
+  }
   if (++g_frame % 3 != 0) return;
   if (api->read_u8(kMpFlag) != 0) return;  // no converting in multiplayer
   const uint32_t player = api->read_u32(kPlayerPtr);
@@ -282,6 +329,16 @@ void ConvertNpc(WmlContext* ctx, uint8_t* base, uint32_t obj, uint32_t team, uin
   const uint32_t ai = api->read_u32(obj + 568);
   if (ai) {
     api->write_u32(ai + 3704, g_next_flee_mode);
+    // Behavior node swap: ai+3748 points into the AI behavior list (nodes
+    // with function pointers at 0x82BE16xx). The recruit/dismiss cycle moved
+    // it from 0x82C06D7C to the combatant node 0x82C06D70.
+    const uint32_t behavior = api->read_u32(ai + 3748);
+    if (behavior != 0x82C06D70u) {
+      api->write_u32(ai + 3748, 0x82C06D70u);
+      char note[128];
+      snprintf(note, sizeof(note), "  behavior node 0x%08X -> 0x82C06D70", behavior);
+      api->log(self, note);
+    }
   } else {
     char note[128];
     snprintf(note, sizeof(note), "  note: obj 0x%08X has no AI persona (+568 null)", obj);

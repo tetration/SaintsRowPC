@@ -93,6 +93,12 @@ hardcoding.
   archetype+0 (8 bytes): "BF_MID", "BM_YNG", "HM_3SS3" (3rd Street Saints).
 - `combat_enable`/`combat_disable` only toggle bit 0x08 at entity+3692;
   insufficient to stop personality-driven fleeing.
+- **Behavior node** (persona+3748): points into the AI behavior list (nodes
+  at 0x82C06xxx with function pointers at 0x82BE16xx). 0x82C06D70 =
+  combatant (fights, no gunshot panic); 0x82C06D7C / 0x82C06E0C =
+  flee-capable. Some civilian archetypes ship on the combatant node already
+  ("feisty" civilians that join fights unprovoked). Writing the combatant
+  node at conversion makes converts fight even when already fleeing.
 
 ## Spawning (from Living Stilwater, useful for spawn-peds/zombie mods)
 
