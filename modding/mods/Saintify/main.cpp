@@ -47,33 +47,32 @@ uint32_t g_next_flee_mode = 4;  // calibrated: 4 = "never cower or flee"
 bool g_enabled = true;
 ULONGLONG g_notice_until = 0;
 
-// Hook on sub_82483828: the game's damage/interaction snapshot function
-// (r4 = victim object, r3 = source object). A source equal to the player
-// object means the player dealt the damage. Victims are marked briefly and
-// converted when their health actually drops.
+// Hook on sub_824470D0: the character damage function (r3 = victim object,
+// r4 = attacker object; identified by hook-testing every function that
+// subtracts from health at +1912). When the attacker is the player object,
+// the victim is marked briefly and converted when its health actually drops.
 WmlGuestFunction g_orig_damage_fn = nullptr;
 std::unordered_map<uint32_t, ULONGLONG> g_hit_by_player;  // victim -> tick
 int g_hook_log_budget = 20;
-bool g_attribution_proven = false;  // set once the hook sees src == player
+bool g_attribution_proven = false;  // set once the hook sees attacker == player
 
 void DamageHook(WmlContext* ctx, uint8_t* base) {
-  const uint32_t source = static_cast<uint32_t>(api->get_r(ctx, 3));
-  const uint32_t victim = static_cast<uint32_t>(api->get_r(ctx, 4));
+  const uint32_t victim = static_cast<uint32_t>(api->get_r(ctx, 3));
+  const uint32_t attacker = static_cast<uint32_t>(api->get_r(ctx, 4));
   const uint32_t player = api->read_u32(kPlayerPtr);
   if (g_hook_log_budget > 0 && victim) {
     --g_hook_log_budget;
     char line[224];
     snprintf(line, sizeof(line),
-             "dmg hook: src 0x%08X victim 0x%08X r5 %llu player 0x%08X %s",
-             source, victim, (unsigned long long)api->get_r(ctx, 5), player,
-             source == player ? "<-- PLAYER" : "");
+             "dmg hook: victim 0x%08X attacker 0x%08X player 0x%08X %s",
+             victim, attacker, player, attacker == player ? "<-- PLAYER" : "");
     api->log(self, line);
   }
-  if (source && source == player && victim) {
+  if (attacker && attacker == player && victim) {
     g_hit_by_player[victim] = GetTickCount64();
     if (!g_attribution_proven) {
       g_attribution_proven = true;
-      api->log(self, "player attribution confirmed (src == player); enforcing it");
+      api->log(self, "player attribution confirmed (attacker == player); enforcing it");
     }
   }
   g_orig_damage_fn(ctx, base);
@@ -268,7 +267,7 @@ extern "C" WML_EXPORT int wml_mod_init(const WmlApi* loader_api, const WmlMod* m
   self = mod;
   if (api->version < WML_API_VERSION) return 1;
   api->on_frame(OnFrame, nullptr);
-  if (api->hook(0x82483828, DamageHook, &g_orig_damage_fn) != 0) {
+  if (api->hook(0x824470D0, DamageHook, &g_orig_damage_fn) != 0) {
     api->log(self, "WARNING: damage hook failed; player attribution disabled");
   }
   api->log(self, "Saintify v6 armed: hit an NPC up close while on foot to convert them. F3 toggles, F7/F8 dump.");

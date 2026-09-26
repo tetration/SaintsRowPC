@@ -125,6 +125,7 @@ Living Stilwater).
 | 0x82209E30 | recurring game-loop update (hook target used by the trainer) |
 | 0x82B2E0B0 | cheat table (count at +512; weapon-grant entries have +16 == 0x821F56C0) |
 | 0x830866C8 | object handle table (see above) |
+| 0x824470D0 | character damage function: r3 = victim object, r4 = attacker object (called through vtables, no direct call sites; hook it to attribute damage) |
 
 ## WML quick reference
 
@@ -148,3 +149,7 @@ Living Stilwater).
 - Mod code runs inside the game's process; long scans in `wml_mod_init`
   block startup (looks like a black screen). Defer heavy work to a frame
   callback.
+
+
+## Something to Try Tomorrow to fix the converted civiliansw fleeing problem
+- It seems that if I "infect them(aka saintify)" and then recruit to follow they instantly stop fleeing and then dismiss then they become combatants. Might be worth looking how the game does that maybe we can do something similar to change their AI behaviour
