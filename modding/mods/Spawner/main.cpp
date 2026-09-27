@@ -20,6 +20,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include <rex/ppc/context.h>
 #include "wml.h"
 
 namespace {
@@ -38,9 +39,7 @@ constexpr int kObjArchetype = 3552;
 // row 3 (+104) points where the camera looks.
 constexpr uint32_t kCameraState = 0x827D9778;
 
-// Traffic spawn pipeline: find_spots (0x82412298) then car_spawn
-// (0x82411310, returns the vehicle in r3).
-constexpr uint32_t kFindSpots = 0x82412298;
+// Traffic spawn pipeline: car_spawn (0x82411310, returns the vehicle in r3).
 constexpr uint32_t kCarSpawn = 0x82411310;
 
 bool g_menu_open = false;
@@ -50,11 +49,6 @@ std::string g_target_desc;
 
 void TeleportObject(uint32_t obj, float x, float y, float z);
 
-// Params captured from a live find_spots call (the traffic spawner builds
-// them with helpers; reusing a captured copy avoids guessing the layout).
-uint8_t g_spot_params[128] = {};
-bool g_have_spot_params = false;
-WmlGuestFunction g_orig_find_spots = nullptr;
 WmlGuestFunction g_orig_present = nullptr;
 
 float ObjDist(uint32_t a, uint32_t b) {
@@ -86,6 +80,7 @@ void RefreshMenu() {
            "2) Save target address\n"
            "3) Bring target to me\n"
            "4) Spawn vehicle near me (experimental)\n"
+           "5) Dump cheat table (log)\n"
            "%s%s",
            g_target ? g_target_desc.c_str() : "(none)",
            g_note.empty() ? "" : "\n", g_note.c_str());
@@ -182,99 +177,88 @@ void BringTarget() {
   RefreshMenu();
 }
 
-// Writes both the render position (+20) and the physics position (+76);
-// writing only +20 lets the physics body snap the object back.
+// Writes the new position everywhere the object caches it: the game keeps
+// position copies in several places (render at +20, physics body, bone/anim
+// caches), and writing only +20 lets them snap the object back. We find every
+// float triple currently equal to the object's position and rewrite them all.
 void TeleportObject(uint32_t obj, float x, float y, float z) {
-  api->write_f32(obj + kObjPos, x);
-  api->write_f32(obj + kObjPos + 4, y);
-  api->write_f32(obj + kObjPos + 8, z);
-  api->write_f32(obj + 76, x);
-  api->write_f32(obj + 76 + 4, y);
-  api->write_f32(obj + 76 + 8, z);
-}
-
-// Capture the spot-search params the traffic spawner built, for reuse.
-void FindSpotsHook(WmlContext* ctx, uint8_t* base) {
-  if (!g_have_spot_params) {
-    const uint32_t params = static_cast<uint32_t>(api->get_r(ctx, 5));
-    if (params) {
-      for (int i = 0; i < 128; i += 4) {
-        const uint32_t v = api->read_u32(params + i);
-        memcpy(g_spot_params + i, &v, 4);  // keep big-endian bytes
-      }
-      g_have_spot_params = true;
-      api->log(self, "spawner: captured find_spots params");
+  const float cx = api->read_f32(obj + kObjPos);
+  const float cy = api->read_f32(obj + kObjPos + 4);
+  const float cz = api->read_f32(obj + kObjPos + 8);
+  for (int off = 0; off <= 4200 - 12; off += 4) {
+    const float fx = api->read_f32(obj + off);
+    const float fy = api->read_f32(obj + off + 4);
+    const float fz = api->read_f32(obj + off + 8);
+    if (std::fabs(fx - cx) < 0.01f && std::fabs(fy - cy) < 0.01f && std::fabs(fz - cz) < 0.01f) {
+      api->write_f32(obj + off, x);
+      api->write_f32(obj + off + 4, y);
+      api->write_f32(obj + off + 8, z);
     }
   }
-  g_orig_find_spots(ctx, base);
+}
+
+// Capture a REAL car_spawn call (spot struct contents + arg registers) and
+// replay it on demand. find_spots alone gives bare positions; the model/group
+// context only exists in a genuine spawner call.
+WmlGuestFunction g_orig_car_spawn = nullptr;
+uint64_t g_car_args[4] = {};    // r3..r6 of the captured call
+uint8_t g_spot_copy[256] = {};  // host-order copy of the spot struct
+bool g_have_car_call = false;
+
+void CarSpawnHook(WmlContext* ctx, uint8_t* base) {
+  if (!g_have_car_call) {
+    const uint32_t spot = static_cast<uint32_t>(api->get_r(ctx, 3));
+    if (spot) {
+      for (int i = 0; i < 256; i += 4) {
+        const uint32_t v = api->read_u32(spot + i);  // host order
+        memcpy(g_spot_copy + i, &v, 4);
+      }
+      for (int r = 3; r <= 6; ++r) g_car_args[r - 3] = api->get_r(ctx, r);
+      g_have_car_call = true;
+      api->log(self, "spawner: captured a live car spawn call");
+    }
+  }
+  g_orig_car_spawn(ctx, base);
 }
 
 // Runs on the present hook (has a PPC context for api->call).
-uint32_t ctx_r1(WmlContext* ctx) { return static_cast<uint32_t>(api->get_r(ctx, 1)); }
-
 void SpawnVehicle(WmlContext* ctx, uint8_t* base) {
   const uint32_t player = api->read_u32(kPlayerPtr);
   if (!player) {
     g_note = "not in gameplay";
     return;
   }
-  if (!g_have_spot_params) {
-    g_note = "no spot params yet (drive around a bit first)";
+  if (!g_have_car_call) {
+    g_note = "no car spawn captured yet (drive around first)";
     return;
   }
-  // Guest scratch space on the current guest stack.
-  const uint32_t scratch = ctx_r1(ctx) - 4096;
-  const uint32_t spots_out = scratch;       // find_spots writes spots here
-  const uint32_t params = scratch + 1024;   // our captured params copy
-  for (int i = 0; i < 128; i += 4) {
+  // Synthetic context from the present hook's state (trainer pattern).
+  PPCContext sctx;
+  std::memcpy(&sctx, ctx, sizeof(sctx));
+  if (sctx.r1.u32 < 0x2000) return;
+  const uint32_t spot = sctx.r1.u32 - 8192;  // scratch below the frame
+  sctx.r1.u32 -= 512;
+  for (int i = 0; i < 256; i += 4) {
     uint32_t v;
-    memcpy(&v, g_spot_params + i, 4);
-    api->write_u32(params + i, v);
+    memcpy(&v, g_spot_copy + i, 4);
+    api->write_u32(spot + i, v);
   }
-  const uint64_t saved_r3 = api->get_r(ctx, 3);
-  const uint64_t saved_r4 = api->get_r(ctx, 4);
-  const uint64_t saved_r5 = api->get_r(ctx, 5);
-  const uint64_t saved_r6 = api->get_r(ctx, 6);
-  const uint64_t saved_r7 = api->get_r(ctx, 7);
-
-  api->set_r(ctx, 3, spots_out);
-  api->set_r(ctx, 4, player + kObjPos);  // search around the player
-  api->set_r(ctx, 5, params);
-  api->set_r(ctx, 6, 0);
-  api->set_r(ctx, 7, 1);  // allow spots in view
-  api->call(ctx, kFindSpots);
-  const uint32_t result = static_cast<uint32_t>(api->get_r(ctx, 3));
-
-  uint32_t vehicle = 0;
-  if (result) {
-    const uint32_t spot = api->read_u32(spots_out);  // first spot
-    if (spot) {
-      api->set_r(ctx, 3, spot);
-      api->set_r(ctx, 4, 0);
-      api->set_r(ctx, 5, 0);
-      api->set_r(ctx, 6, 0);
-      api->call(ctx, kCarSpawn);
-      vehicle = static_cast<uint32_t>(api->get_r(ctx, 3));
-      if (vehicle) {
-        // The captured params spawn cars far out (4-6 km radius); bring the
-        // new vehicle to the player instead.
-        const float lx = api->read_f32(kCameraState + 104);
-        const float lz = api->read_f32(kCameraState + 112);
-        TeleportObject(vehicle, api->read_f32(player + kObjPos) + lx * 6.0f,
-                       api->read_f32(player + kObjPos + 4),
-                       api->read_f32(player + kObjPos + 8) + lz * 6.0f);
-      }
-    }
+  sctx.r3.u64 = spot;
+  sctx.r4.u64 = g_car_args[1];
+  sctx.r5.u64 = g_car_args[2];
+  sctx.r6.u64 = g_car_args[3];
+  api->call(reinterpret_cast<WmlContext*>(&sctx), kCarSpawn);
+  const uint32_t vehicle = static_cast<uint32_t>(sctx.r3.u64);
+  if (vehicle) {
+    // The captured spot is wherever the real spawn was; bring it here.
+    const float lx = api->read_f32(kCameraState + 104);
+    const float lz = api->read_f32(kCameraState + 112);
+    TeleportObject(vehicle, api->read_f32(player + kObjPos) + lx * 6.0f,
+                   api->read_f32(player + kObjPos + 4),
+                   api->read_f32(player + kObjPos + 8) + lz * 6.0f);
   }
-
-  api->set_r(ctx, 3, saved_r3);
-  api->set_r(ctx, 4, saved_r4);
-  api->set_r(ctx, 5, saved_r5);
-  api->set_r(ctx, 6, saved_r6);
-  api->set_r(ctx, 7, saved_r7);
-
   char note[160];
-  snprintf(note, sizeof(note), "find_spots -> %u, vehicle = 0x%08X", result, vehicle);
+  snprintf(note, sizeof(note), "car spawn -> vehicle 0x%08X", vehicle);
   g_note = note;
   api->log(self, note);
 }
@@ -288,6 +272,42 @@ void PresentHook(WmlContext* ctx, uint8_t* base) {
     RefreshMenu();
   }
   g_orig_present(ctx, base);
+}
+
+// Dumps the cheat table (0x82B2E0B0, count at +512, entry pointers from +0).
+// Weapon-grant cheats have function 0x821F56C0 (per the trainer); vehicle
+// spawn cheats will have their own - this finds them by name/fn pointer.
+void DumpCheats() {
+  const uint32_t count = api->read_u32(0x82B2E0B0 + 512);
+  char line[256];
+  snprintf(line, sizeof(line), "--- cheat table: %u entries ---", count);
+  api->log(self, line);
+  for (uint32_t i = 0; i < count && i < 128; ++i) {
+    const uint32_t entry = api->read_u32(0x82B2E0B0 + i * 4);
+    if (!entry) continue;
+    const uint32_t fn = api->read_u32(entry + 16);
+    // Try to read a name string at a few likely offsets.
+    char name[64] = {};
+    for (int off : {0, 4, 8, 24}) {
+      const uint32_t sp = api->read_u32(entry + off);
+      if (sp < 0x82000000 || sp >= 0x84160000) continue;
+      const char* s = reinterpret_cast<const char*>(
+          static_cast<uint8_t*>(api->guest_pointer(sp)));
+      int j = 0;
+      for (; j < 63; ++j) {
+        const char c = s[j];
+        if (!c) break;
+        if (c < 0x20 || c > 0x7E) break;
+        name[j] = c;
+      }
+      name[j] = 0;
+      if (j >= 3) break;
+    }
+    snprintf(line, sizeof(line), "  [%u] entry 0x%08X fn 0x%08X name \"%s\"", i, entry, fn, name);
+    api->log(self, line);
+  }
+  g_note = "cheat table dumped to wml.log";
+  RefreshMenu();
 }
 
 void OnFrame(void*) {
@@ -304,6 +324,8 @@ void OnFrame(void*) {
     } else if (api->key_pressed('4')) {
       g_spawn_requested = true;  // executed on the present hook (has ctx)
       g_note = "spawning...";
+    } else if (api->key_pressed('5')) {
+      DumpCheats();
     }
     RefreshMenu();
   }
@@ -319,8 +341,8 @@ extern "C" WML_EXPORT int wml_mod_init(const WmlApi* loader_api, const WmlMod* m
   if (api->hook(0x825E54A8, PresentHook, &g_orig_present) != 0) {
     api->log(self, "WARNING: present hook failed; spawning disabled");
   }
-  if (api->hook(kFindSpots, FindSpotsHook, &g_orig_find_spots) != 0) {
-    api->log(self, "WARNING: find_spots hook failed");
+  if (api->hook(kCarSpawn, CarSpawnHook, &g_orig_car_spawn) != 0) {
+    api->log(self, "WARNING: car spawn hook failed");
   }
   api->log(self, "Spawner armed: F2 opens the menu.");
   return 0;
