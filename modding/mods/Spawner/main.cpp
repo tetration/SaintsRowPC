@@ -48,6 +48,8 @@ std::string g_note;
 uint32_t g_target = 0;         // selected object (guest address)
 std::string g_target_desc;
 
+void TeleportObject(uint32_t obj, float x, float y, float z);
+
 // Params captured from a live find_spots call (the traffic spawner builds
 // them with helpers; reusing a captured copy avoids guessing the layout).
 uint8_t g_spot_params[128] = {};
@@ -175,11 +177,20 @@ void BringTarget() {
   const float nx = api->read_f32(player + kObjPos) + lx * 2.5f;
   const float ny = api->read_f32(player + kObjPos + 4);
   const float nz = api->read_f32(player + kObjPos + 8) + lz * 2.5f;
-  api->write_f32(g_target + kObjPos, nx);
-  api->write_f32(g_target + kObjPos + 4, ny);
-  api->write_f32(g_target + kObjPos + 8, nz);
+  TeleportObject(g_target, nx, ny, nz);
   g_note = "target moved";
   RefreshMenu();
+}
+
+// Writes both the render position (+20) and the physics position (+76);
+// writing only +20 lets the physics body snap the object back.
+void TeleportObject(uint32_t obj, float x, float y, float z) {
+  api->write_f32(obj + kObjPos, x);
+  api->write_f32(obj + kObjPos + 4, y);
+  api->write_f32(obj + kObjPos + 8, z);
+  api->write_f32(obj + 76, x);
+  api->write_f32(obj + 76 + 4, y);
+  api->write_f32(obj + 76 + 8, z);
 }
 
 // Capture the spot-search params the traffic spawner built, for reuse.
@@ -244,6 +255,15 @@ void SpawnVehicle(WmlContext* ctx, uint8_t* base) {
       api->set_r(ctx, 6, 0);
       api->call(ctx, kCarSpawn);
       vehicle = static_cast<uint32_t>(api->get_r(ctx, 3));
+      if (vehicle) {
+        // The captured params spawn cars far out (4-6 km radius); bring the
+        // new vehicle to the player instead.
+        const float lx = api->read_f32(kCameraState + 104);
+        const float lz = api->read_f32(kCameraState + 112);
+        TeleportObject(vehicle, api->read_f32(player + kObjPos) + lx * 6.0f,
+                       api->read_f32(player + kObjPos + 4),
+                       api->read_f32(player + kObjPos + 8) + lz * 6.0f);
+      }
     }
   }
 
