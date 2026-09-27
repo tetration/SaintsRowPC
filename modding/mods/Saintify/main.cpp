@@ -11,6 +11,7 @@
 // team id is read from the player (the player is a Playas).
 
 #include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -58,6 +59,84 @@ constexpr uint32_t kKnownNodes[] = {0, 0x82C06D70, 0x82C06D7C, 0x82C06E0C};
 const char* kNodeModeNames[] = {"nearby gang NPC", "combatant (0x82C06D70)",
                                 "node 0x82C06D7C", "node 0x82C06E0C"};
 
+// Heat on convert (menu option 8, default off): converting civilians raises
+// police heat; converting gang members raises their faction's heat.
+bool g_heat_enabled = false;
+int g_police_faction = -1;       // resolved from the faction name table
+int g_team_to_faction[16];       // team id -> faction index (-1 = none)
+bool g_factions_resolved = false;
+
+// Notoriety: faction i's heat value = read_u32(wrapper + 3868 + i*24),
+// wrapper = *(0x82C9AC0C) (from notoriety_get, 0x824D4290). Faction names
+// are in a 5-entry pointer table at 0x827D6628 (from sub_821D2E88).
+constexpr uint32_t kFactionNameTable = 0x827D6628;
+constexpr uint32_t kTeamNameTable = 0x820387D8;  // indexed by team id
+
+std::string ReadImageString(uint32_t addr) {
+  if (addr < 0x82000000 || addr >= 0x84160000) return {};
+  const char* p = reinterpret_cast<const char*>(
+      static_cast<uint8_t*>(api->guest_pointer(addr)));
+  std::string out;
+  for (int i = 0; i < 64; ++i) {
+    const char c = p[i];
+    if (!c) break;
+    if (c < 0x20 || c > 0x7E) return {};
+    out += c;
+  }
+  return out;
+}
+
+std::string ToLower(std::string s) {
+  for (char& c : s) c = char(std::tolower(uint8_t(c)));
+  return s;
+}
+
+void ResolveFactions() {
+  if (g_factions_resolved) return;
+  g_factions_resolved = true;
+  for (int& v : g_team_to_faction) v = -1;
+
+  std::string faction_names[5];
+  for (int i = 0; i < 5; ++i) {
+    faction_names[i] = ToLower(ReadImageString(api->read_u32(kFactionNameTable + i * 4)));
+    if (faction_names[i].find("police") != std::string::npos) g_police_faction = i;
+    api->log(self, ("  faction " + std::to_string(i) + " = \"" + faction_names[i] + "\"").c_str());
+  }
+  for (int team = 0; team < 8; ++team) {
+    const std::string team_name =
+        ToLower(ReadImageString(api->read_u32(kTeamNameTable + team * 4)));
+    for (int i = 0; i < 5; ++i) {
+      if (!team_name.empty() && !faction_names[i].empty() &&
+          faction_names[i].find(team_name) != std::string::npos) {
+        g_team_to_faction[team] = i;
+        break;
+      }
+    }
+    if (team_name.find("police") != std::string::npos && g_police_faction >= 0) {
+      g_team_to_faction[team] = g_police_faction;
+    }
+  }
+}
+
+// Adds heat for the given victim's original team: gangs -> their faction,
+// anyone else -> police.
+void AddConvertHeat(uint32_t victim_team) {
+  ResolveFactions();
+  const uint32_t wrapper = api->read_u32(0x82C9AC0C);
+  if (!wrapper) return;
+  int faction = g_police_faction;
+  if (victim_team < 16 && g_team_to_faction[victim_team] >= 0) {
+    faction = g_team_to_faction[victim_team];
+  }
+  if (faction < 0) return;
+  const uint32_t addr = wrapper + 3868 + faction * 24;
+  const uint32_t before = api->read_u32(addr);
+  api->write_u32(addr, before + 50);
+  char line[160];
+  snprintf(line, sizeof(line), "  heat: faction %d %u -> %u", faction, before, before + 50);
+  api->log(self, line);
+}
+
 // F3 toggles the mod's menu (like Whompay's trainer); number keys act.
 bool g_enabled = true;
 bool g_menu_open = false;
@@ -76,9 +155,11 @@ void RefreshMenuText() {
            "5) Behavior descriptors (file)\n"
            "6) Converts can convert others: %s\n"
            "7) Behavior node: %s\n"
+           "8) Heat on convert: %s\n"
+           "9) Dump notoriety (log)\n"
            "converted: %d%s%s",
            g_enabled ? "ON" : "OFF", g_spread_enabled ? "ON" : "OFF",
-           kNodeModeNames[g_node_mode], g_converted,
+           kNodeModeNames[g_node_mode], g_heat_enabled ? "ON" : "OFF", g_converted,
            g_action_note.empty() ? "" : "\n", g_action_note.c_str());
   api->overlay_text(text);
 }
@@ -91,6 +172,28 @@ void ToggleMenu() {
   } else if (api->size >= sizeof(WmlApi) && api->overlay_text) {
     api->overlay_text("");
   }
+}
+
+// Notoriety: faction i's heat = read_u32(wrapper + 3868 + i*24),
+// wrapper = *(0x82C9AC0C) (from notoriety_get, 0x824D4290). Faction names
+// are in a 5-entry pointer table at 0x827D6628 (from sub_821D2E88).
+void DumpNotoriety() {
+  char line[256];
+  api->log(self, "--- notoriety dump ---");
+  ResolveFactions();
+  const uint32_t wrapper = api->read_u32(0x82C9AC0C);
+  if (!wrapper) {
+    api->log(self, "  no player wrapper (not in gameplay?)");
+  } else {
+    for (int i = 0; i < 5; ++i) {
+      const uint32_t v = api->read_u32(wrapper + 3868 + i * 24);
+      snprintf(line, sizeof(line), "  faction[%d] heat = %u (0x%08X)", i, v, v);
+      api->log(self, line);
+    }
+  }
+  api->log(self, "--- end notoriety dump ---");
+  g_action_note = "notoriety dumped to wml.log";
+  RefreshMenuText();
 }
 
 // Hook on sub_824470D0: the character damage function (r3 = victim object,
@@ -387,6 +490,10 @@ void OnFrame(void*) {
       g_spread_enabled = !g_spread_enabled;
     } else if (api->key_pressed('7')) {
       g_node_mode = (g_node_mode + 1) % 4;
+    } else if (api->key_pressed('8')) {
+      g_heat_enabled = !g_heat_enabled;
+    } else if (api->key_pressed('9')) {
+      DumpNotoriety();
     }
     RefreshMenuText();
   }
@@ -406,6 +513,9 @@ void OnFrame(void*) {
 void ConvertNpc(WmlContext* ctx, uint8_t* base, uint32_t obj, uint32_t team, uint32_t player) {
   const uint32_t old_team = api->read_u32(obj + kObjTeam);
   api->write_u32(obj + kObjTeam, team);
+  if (g_heat_enabled) {
+    AddConvertHeat(old_team);
+  }
   const uint32_t player_handle = api->read_u32(player + kObjHandle);
   // combat_enable: clear the "combat disabled" bit (combat_disable sets
   // 0x08 at obj+3692, combat_enable clears it).
