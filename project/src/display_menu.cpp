@@ -92,6 +92,24 @@ void RestoreDesktopMode(const std::string& device) {
     ChangeDisplaySettingsExA(device.c_str(), nullptr, nullptr, 0, nullptr);
 }
 
+// Exiting fullscreen programmatically can leave the window without the
+// standard frame (no caption, so no minimize/maximize/close buttons) when
+// SDL's bookkeeping lost track of the fullscreen state, e.g. after a display
+// mode change re-enumerated the displays. Force the overlapped style back on;
+// SDL recomputes the style from its own flags on the next fullscreen
+// transition, so this does not disturb it.
+void EnsureWindowedFrame(HWND hwnd) {
+    LONG_PTR style = GetWindowLongPtrA(hwnd, GWL_STYLE);
+    if (!(style & WS_POPUP) && (style & WS_CAPTION) == WS_CAPTION) {
+        return;  // already has a normal frame
+    }
+    style &= ~WS_POPUP;
+    style |= WS_OVERLAPPEDWINDOW;
+    SetWindowLongPtrA(hwnd, GWL_STYLE, style);
+    SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
 void ResizeWindow(HWND hwnd, int width, int height) {
     RECT rect{0, 0, width, height};
     AdjustWindowRect(&rect, static_cast<DWORD>(GetWindowLongPtrA(hwnd, GWL_STYLE)), FALSE);
@@ -261,6 +279,7 @@ void DisplaySettingsDialog::SetMode(int width, int height, int refresh, WindowMo
                 desktop_mode_changed_ = false;
             }
             window_->SetFullscreen(false);
+            EnsureWindowedFrame(hwnd);
             ResizeWindow(hwnd, width, height);
             break;
     }
@@ -315,6 +334,9 @@ void DisplaySettingsDialog::RevertPending() {
             window_->SetFullscreen(true);
         } else {
             window_->SetFullscreen(false);
+            if (hwnd) {
+                EnsureWindowedFrame(hwnd);
+            }
             if (hwnd && snapshot_.width > 0) {
                 ResizeWindow(hwnd, snapshot_.width, snapshot_.height);
             }
