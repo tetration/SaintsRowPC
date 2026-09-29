@@ -18,7 +18,11 @@ into `dist/mods/scriptapi_map.txt`.
   heap address (seen at 0x92099E60) plus an alphabetical packed string block
   nearby (0x9207xxxx). Cookie = 0x40000000 | (id16 << 8) | flags8; the exact
   id16 meaning is undecoded (not a CRC32/Jenkins/FNV of the name).
-- Lua state pointer: `*(uint32_t*)0x82C9AC0C` (loaded by every thunk).
+- Lua state pointer: `*(uint32_t*)0x82C9AC0C` - **unverified**; no code in the
+  recompiled source uses the 0x82CA0000 base at all (`lis rN,-32054` never
+  appears), so this was probably derived with the same off-by-0x400000 mistake
+  that sent the notoriety writes into nowhere. Re-derive it before relying on
+  it (the thunks themselves take the state in r3).
 - Thunks take the Lua state in r3 and pull args off the Lua stack via
   `sub_824EFD70(L, -1/-2/...)`; then they resolve script object args
   (handle or name) with `sub_824C5F20` / `sub_824C6498` / `sub_824C6428`.
@@ -133,6 +137,94 @@ Living Stilwater).
 | 0x830866C8 | object handle table (see above) |
 | 0x824470D0 | character damage function: r3 = victim object, r4 = attacker object (called through vtables, no direct call sites; hook it to attribute damage) |
 
+## Notoriety / heat
+
+- The notoriety entries live **on the player object**, `*(uint32_t*)0x8309ABEC`
+  - the same pointer the rest of this file calls the player object. The crime
+  drain (sub_821D2AD0), the reporter (sub_82481B28), `notoriety_get`
+  (0x824D4290) and `notoriety_set` (0x824D4520) all load that one global.
+  **Beware the PPC address arithmetic**: it appears as `lis rN,-31990` +
+  `lwz rM,-21524(rN)`, and -31990 means high half `0x830A` (imm + 0x10000),
+  so the address is 0x830A0000 - 21524 = **0x8309ABEC**. Reading the high half
+  as 0x82CA gives 0x82C9ABEC, an unrelated address - heat written there lands
+  in random memory, which is exactly why "the numbers rose but no wanted star
+  ever appeared" for several days of debugging.
+- Faction i's entry: `player + 3868 + i*24`. Layout: `+0` = wanted level
+  (int, 0-5), `+4` = min level clamp, `+8` = **max level cap** (written by
+  sub_821D3010 / sub_821D3070; story-progression gated - on an early save it
+  is 1, and sub_821D2178 adds NO points when level >= cap. notoriety_reset
+  (0x824D4418) sets min 0 / max 5; lift it the same way or heat never rises),
+  `+12` = progress points toward next level (f32), `+16` = decay timestamp
+  (set by sub_821D2468 = tick + delay[level], delay table 0x82B2BA84),
+  `+20` = "force no spawn" flag.
+- Points-per-level table: 5 ints at 0x82B2BAB4 (75 / 300 / 700 / 1200 /
+  2500). `notoriety_get_decimal` (0x824D4338) returns `level + progress/table[level]`.
+- **Runtime team ids are NOT the teams.xtbl order.** sub_821D2EE8's jump table
+  maps team 0 -> faction 3, 1 -> 0, 2 -> 1, 3 -> 2, **team 5 (Police) ->
+  faction 4**, and everything else (team 4 = Neutral Gang, team 6 = Civilian,
+  anything above) -> -1, no faction. Faction -1 is not "nothing": sub_821D2BE0
+  turns it into the police, which is how killing a civilian raises police
+  heat. Verify team ids with the name table at 0x820387D8.
+- **The HUD meter is event-driven, not polled.** Writing the entries (or
+  calling the setter sub_821D2F50) changes the numbers and alerts faction
+  NPCs, but the visible wanted meter only updates through the crime
+  reporter's HUD event - so mods should report crimes, not write entries.
+- **Crime pipeline** (the way real heat is added):
+  - `sub_821D3148(crime_class, team, counts_without_witness, damage_info)`
+    queues a 16-byte crime event: `{+0 class, +4 team, +8 report delay,
+    +12 u8 "counts without witness", +13 u8 point multiplier}` into the queue
+    at 0x838F9348 (count at 0x82B2BA6C, max 30; when the queue is full it
+    reports the event straight away instead). `damage_info` may be 0 - it is
+    only read to decide the multiplier. **This is the call mods want**: it
+    needs no player pointer and the engine does the rest.
+  - `sub_821D2AD0` drains the queue per frame and calls the reporter.
+  - `sub_82481B28(player, &event)` reports: resolves team -> faction
+    (`sub_821D2EE8`), adds points (`sub_821D2840` crime-table lookup ->
+    `sub_821D2178` add-points with min/max clamps and level-up), alerts
+    faction NPCs (`sub_821D1A20`), updates music (`sub_822F5300`), and posts
+    the HUD notoriety event that moves the wanted meter.
+  - **The crime the game reports for a kill** (sub_82482098, switched on the
+    victim's team): civilian (team 6) -> class 4 / team -1, police (team 5) ->
+    class 20 / team -1, rival gang (teams 1-3) -> class 11 / team = the
+    victim's team; fellow Saints (team 0) and the neutral gang (team 4) are no
+    crime. `sub_82481CD8(player, &pos, class, flag, team, damage_info)` is the
+    engine's own generic wrapper around the queue (it guards the player alive
+    check, the MP flag and team != 0/4, and ignores the position argument).
+  - `sub_821D2840` refuses the points when the faction's level is already
+    **above** the crime's cap (`table+12`), and when the crime requires a
+    witness (`table+16`) it calls sub_821D1F98(player) unless the event's
+    "counts without witness" byte is set - so pass 1 there for a crime that
+    should always count.
+  - Crime table at 0x82B2BAC8: `[class*5 + faction] * 20` bytes: `+0` =
+    points awarded, `+12` = level cap this crime can raise to, `+16` = u8
+    witness-required flag. (Indexing verified against sub_821D2BE0 ->
+    sub_821D2840: the entry index is the faction, scaled by 5, plus the
+    class. Runtime values: class 0 = generic street crime, 100 pts cap 3 vs
+    police / 10 pts cap 3 vs gangs; class 4 = police-specific 55 pts cap 3.)
+  - The reporter's guard `sub_82448D18(player)` is the generic character
+    alive-check (f32 at +1912 must be > 0 **and** bit 31 of +2996 set; it
+    returns nonzero to *reject*). It passes on the real player object - the
+    "it always rejects" note here came from reading 0x82C9ABEC instead of
+    0x8309ABEC. The engine's own crimes go through this exact guard, so any
+    report that works for the game works for a mod too.
+  - Its core, `sub_821D2BE0(entries_base=player+3868, crime_class, faction,
+    counts_without_witness, multiplier, &out_level, &out_points)`, can also be
+    called directly (no guards, no HUD event) when heat should rise without
+    telling the HUD. Faction -1 here means the police.
+  - The reporter's HUD block uses `element = handle_table[*(player+4036) >>
+    16]` at 0x830A1A70 (20-byte entries, object at +12), message =
+    sub_824C0160(element,0,0,0), sub_824C5260(msg, crime_class_name[cls] at
+    0x8286E5C8), two float params (type tag 3, appended at
+    `*(*(msg+4)+8)`, bumping msg+52), and sub_824C5260(msg, team_name[team] at
+    0x820398D8). Earlier notes claimed this element is never registered and the
+    meter is dead in this port; that was measured on the wrong object and is
+    **not** to be trusted. 0x82FFB592 is a master visibility flag for the
+    meter render (sub_822ECDB0, called from the per-frame HUD update
+    sub_822E1508); the game manages it itself.
+  - Factions: 0=los_carnales, 1=vice_kings, 2=rollers, 3=players, 4=police.
+- `notoriety_set` is a no-op in multiplayer (checks the MP flag at
+  0x8370E9F6 first); so is the crime reporter.
+
 ## WML quick reference
 
 - Native mods: any `*.dll` in the mod folder exporting
@@ -155,6 +247,13 @@ Living Stilwater).
 - Mod code runs inside the game's process; long scans in `wml_mod_init`
   block startup (looks like a black screen). Defer heavy work to a frame
   callback.
+- **Decoding `lis` in the recompiled source**: the comment shows the signed
+  immediate, so the address high half is `imm + 0x10000` for negative values
+  (`lis rN,-31990` -> 0x830A0000, `-32077` -> 0x82B30000, `-31887` ->
+  0x83710000). The recomp also prints the resolved constant next to it
+  (`ctx.rN.s64 = -2096496640;` = 0x830A0000 unsigned), so check against that
+  instead of doing the arithmetic by hand - one wrong high half cost days of
+  chasing a heat feature that was writing into unused memory.
 
 
 ## Something to Try Tomorrow to fix the converted civiliansw fleeing problem
