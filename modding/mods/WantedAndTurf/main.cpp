@@ -1,5 +1,6 @@
 // Wanted & Turf - a mod menu (F6) to set, lock or clear the wanted level of
-// each faction, and to hand the turf the player is standing in to any gang.
+// each faction, change the playa's team allegiance, and hand the turf the
+// player is standing in to any gang.
 //
 // Wanted level: the notoriety entries live on the player object,
 // *(0x8309ABEC) + 3868 + faction*24 (+0 level 0-5, +4 min clamp, +8 max clamp,
@@ -43,6 +44,7 @@ const WmlMod* self;
 constexpr uint32_t kPlayerPtr = 0x8309ABEC;   // player object (0 outside gameplay)
 constexpr uint32_t kMpFlag = 0x8370E9F6;      // multiplayer session flag (byte)
 constexpr int kObjPos = 20;                   // object+20: position vec3f
+constexpr int kObjTeam = 232;                 // object+232: team id (set_team store)
 
 constexpr int kEntriesBase = 3868;            // player + 3868 + faction*24
 constexpr int kEntryStride = 24;
@@ -92,10 +94,23 @@ constexpr OwnerOption kOwners[] = {
 };
 constexpr int kOwnerOptionCount = int(sizeof(kOwners) / sizeof(kOwners[0]));
 
+// Playa allegiance options. Same runtime team ids as the turf owners / the
+// team name table; writing player+232 is what the set_team script thunk does.
+constexpr OwnerOption kAllegiances[] = {
+    {6, "Civilian"},
+    {5, "Police"},
+    {0, "Third Street Saints"},
+    {2, "Vice Kings"},
+    {3, "West Side Rollerz"},
+    {1, "Los Carnales"},
+};
+constexpr int kAllegianceOptionCount = int(sizeof(kAllegiances) / sizeof(kAllegiances[0]));
+
 bool g_menu_open = false;
 int g_faction_idx = 0;
 int g_stars = 3;
 int g_owner_idx = 0;
+int g_allegiance_idx = 0;
 std::string g_status;
 
 // Lock state per faction id. The clamps are snapshotted the first time a
@@ -114,9 +129,9 @@ int g_hood_owner = -1;
 
 // Menu actions are queued here and run from the game-update hook.
 struct Request {
-  enum Kind { kApplyLevel, kClearAll, kSetLock, kSetTurf, kDumpTables };
+  enum Kind { kApplyLevel, kClearAll, kSetLock, kSetTurf, kSetAllegiance, kDumpTables };
   Kind kind;
-  int a;  // faction id / owner team
+  int a;  // faction id / owner team / allegiance team
   int b;  // star level / lock on-off
 };
 Request g_requests[8];
@@ -260,6 +275,23 @@ void SetTurfOwner(int owner_team) {
   g_status = std::string("turf given to ") + TeamName(owner_team) + " (new spawns follow it)";
 }
 
+void SetPlayerAllegiance(uint32_t player, int team) {
+  const int old_team = int(api->read_u32(player + kObjTeam));
+  api->write_u32(player + kObjTeam, uint32_t(team));
+  char line[160];
+  snprintf(line, sizeof(line), "playa allegiance %s -> %s (team %d -> %d)", TeamName(old_team).c_str(),
+           TeamName(team).c_str(), old_team, team);
+  api->log(self, line);
+  g_status = std::string("allegiance set to ") + TeamName(team);
+}
+
+int AllegianceIndexForTeam(int team) {
+  for (int i = 0; i < kAllegianceOptionCount; ++i) {
+    if (kAllegiances[i].team == team) return i;
+  }
+  return 0;
+}
+
 void DumpTables(uint32_t player) {
   char line[224];
   api->log(self, "--- teams (runtime id order) ---");
@@ -352,6 +384,9 @@ void GameUpdateHook(WmlContext* ctx, uint8_t* base) {
       case Request::kSetTurf:
         SetTurfOwner(req.a);
         break;
+      case Request::kSetAllegiance:
+        SetPlayerAllegiance(player, req.a);
+        break;
       case Request::kDumpTables:
         DumpTables(player);
         break;
@@ -385,7 +420,11 @@ void DrawMenu() {
     snprintf(wanted, sizeof(wanted), "%d stars (%d%% to next)", level, WantedPercent(opt.faction));
   }
 
-  char text[640];
+  const uint32_t player = api->read_u32(kPlayerPtr);
+  const std::string current_team =
+      player > 0x1000 ? TeamName(int(api->read_u32(player + kObjTeam))) : std::string("n/a");
+
+  char text[768];
   snprintf(text, sizeof(text),
            "Wanted & Turf (F6 close)\n"
            "\n"
@@ -396,12 +435,17 @@ void DrawMenu() {
            "5  Lock stars: %s\n"
            "6  Clear all wanted levels\n"
            "\n"
+           "Playa: %s\n"
+           "0  Allegiance: %s\n"
+           "P  Set playa allegiance\n"
+           "\n"
            "Turf: %s - owner: %s\n"
            "7  New owner: %s\n"
            "8  Give this turf away\n"
            "9  Dump teams / notoriety / hoods to log%s%s",
            opt.label, wanted, g_stars, g_stars, opt.label,
-           g_locked[opt.faction] ? "ON" : "OFF",
+           g_locked[opt.faction] ? "ON" : "OFF", current_team.c_str(),
+           kAllegiances[g_allegiance_idx].label,
            g_hood_index < 0 ? "(none)" : g_hood_name.c_str(), TeamName(g_hood_owner).c_str(),
            kOwners[g_owner_idx].label, g_status.empty() ? "" : "\n\n",
            g_status.c_str());
@@ -412,6 +456,12 @@ void OnFrame(void*) {
   if (api->key_pressed(VK_F6)) {
     g_menu_open = !g_menu_open;
     g_status.clear();
+    if (g_menu_open) {
+      const uint32_t player = api->read_u32(kPlayerPtr);
+      if (player > 0x1000) {
+        g_allegiance_idx = AllegianceIndexForTeam(int(api->read_u32(player + kObjTeam)));
+      }
+    }
   }
   if (g_menu_open) {
     const FactionOption& opt = kFactions[g_faction_idx];
@@ -444,6 +494,11 @@ void OnFrame(void*) {
       Queue(Request::kSetTurf, kOwners[g_owner_idx].team);
     } else if (api->key_pressed('9')) {
       Queue(Request::kDumpTables);
+    } else if (api->key_pressed('0')) {
+      g_allegiance_idx = (g_allegiance_idx + 1) % kAllegianceOptionCount;
+      g_status.clear();
+    } else if (api->key_pressed('P')) {
+      Queue(Request::kSetAllegiance, kAllegiances[g_allegiance_idx].team);
     }
   }
   DrawMenu();
@@ -463,6 +518,6 @@ extern "C" WML_EXPORT int wml_mod_init(const WmlApi* loader_api, const WmlMod* m
     api->log(self, "WARNING: game-update hook failed; the menu cannot change anything");
   }
   api->on_frame(OnFrame, nullptr);
-  api->log(self, "Wanted & Turf loaded. F6 opens the menu; keys 1-9 act while it is open.");
+  api->log(self, "Wanted & Turf loaded. F6 opens the menu; keys 0-9 and P act while it is open.");
   return 0;
 }
