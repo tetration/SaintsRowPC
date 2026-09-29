@@ -1,6 +1,6 @@
 # Wanted & Turf
 
-A native WML mod menu for heat and turf control. **F5** opens it; the number
+A native WML mod menu for heat and turf control. **F6** opens it; the number
 keys act while it is open.
 
 | Key | Action |
