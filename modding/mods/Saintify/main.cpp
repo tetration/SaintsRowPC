@@ -652,43 +652,6 @@ void DumpAiFields() {
   api->log(self, "--- end AI field scan ---");
 }
 
-// Compact heat readout drawn next to the game's own wanted meter while
-// heat-on-convert is enabled: it shows every faction at once and the exact
-// progress toward the next star, which the meter does not.
-bool g_heat_hud_drawn = false;
-
-void UpdateHeatHud() {
-  if (api->size < sizeof(WmlApi) || !api->overlay_text) return;
-  if (!g_heat_enabled || g_menu_open) {
-    if (g_heat_hud_drawn) {
-      api->overlay_text("");
-      g_heat_hud_drawn = false;
-      api->log(self, "  heat readout: cleared (heat off or menu open)");
-    }
-    return;
-  }
-  char segs[192];
-  if (FormatHeatLine(segs, sizeof(segs)) == 0) {
-    if (g_heat_hud_drawn) {
-      api->overlay_text("");
-      g_heat_hud_drawn = false;
-      api->log(self, "  heat readout: cleared (no heat left)");
-    }
-    return;
-  }
-  char text[240];
-  snprintf(text, sizeof(text), "SAINTIFY HEAT:%s", segs);
-  // Drawn EVERY frame: WhompaysTrainer clears the shared overlay slot when
-  // its own menu is closed, so a throttled draw loses the race.
-  api->overlay_text(text);
-  if (!g_heat_hud_drawn) {
-    g_heat_hud_drawn = true;
-    char line[256];
-    snprintf(line, sizeof(line), "  heat readout: drawing \"%s\"", text);
-    api->log(self, line);
-  }
-}
-
 void OnFrame(void*) {
   // F3 opens/closes the menu; number keys run the actions while it's open.
   if (api->key_pressed(VK_F3)) {
@@ -723,7 +686,6 @@ void OnFrame(void*) {
     }
     RefreshMenuText();
   }
-  UpdateHeatHud();
   if (!g_enabled) return;
   if (++g_frame % 3 != 0) return;
   if (api->read_u8(kMpFlag) != 0) return;  // no converting in multiplayer
