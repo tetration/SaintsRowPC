@@ -1,4 +1,4 @@
-// Wanted & Turf - a mod menu (F5) to set, lock or clear the wanted level of
+// Wanted & Turf - a mod menu (F6) to set, lock or clear the wanted level of
 // each faction, and to hand the turf the player is standing in to any gang.
 //
 // Wanted level: the notoriety entries live on the player object,
@@ -387,7 +387,7 @@ void DrawMenu() {
 
   char text[640];
   snprintf(text, sizeof(text),
-           "Wanted & Turf (F5 close)\n"
+           "Wanted & Turf (F6 close)\n"
            "\n"
            "Faction: %s - %s\n"
            "1  Next faction\n"
@@ -409,7 +409,7 @@ void DrawMenu() {
 }
 
 void OnFrame(void*) {
-  if (api->key_pressed(VK_F5)) {
+  if (api->key_pressed(VK_F6)) {
     g_menu_open = !g_menu_open;
     g_status.clear();
   }
@@ -463,6 +463,6 @@ extern "C" WML_EXPORT int wml_mod_init(const WmlApi* loader_api, const WmlMod* m
     api->log(self, "WARNING: game-update hook failed; the menu cannot change anything");
   }
   api->on_frame(OnFrame, nullptr);
-  api->log(self, "Wanted & Turf loaded. F5 opens the menu; keys 1-9 act while it is open.");
+  api->log(self, "Wanted & Turf loaded. F6 opens the menu; keys 1-9 act while it is open.");
   return 0;
 }
