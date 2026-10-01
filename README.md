@@ -40,15 +40,28 @@ use the faster one.
 
 Download **SaintsReborn-Setup.exe** from the
 [latest release](https://github.com/whompay/SaintsReborn/releases/latest), run
-it, select your `.iso` and press **Install**. Setup downloads and installs
-anything missing (Git, the Visual Studio C++ build tools, the Visual C++
-runtime), builds the game and adds a Saints Reborn shortcut.
+it, choose your `.iso` or a folder with your game files (the one with
+`default.xex` and `packfiles` in it), and press **Install**.
 
-Already built the game? Run **SaintsReborn-Updater.exe** from the same release
-and choose your Saints Reborn folder to get the latest patches and the mod
-loader. Only what changed is rebuilt.
+Setup downloads the build tools it needs: clang, CMake, Ninja and Microsoft's
+C++ headers and libraries. That is about 1.5 GB, all kept in one folder, and
+no Visual Studio is needed. Windows only asks for permission if the Visual C++
+runtime is missing. Setup then builds the game and adds a Saints Reborn
+shortcut. The first build takes 10–60 minutes, depending on your CPU.
 
-## Requirements (manual build)
+To update, run Setup again or use the **Update Saints Reborn** shortcut. Only
+what changed is rebuilt, and your saves and mod list are kept. Installs made
+with the old Setup can be updated the same way.
+
+Co-op and multiplayer are built in, so they don't appear in the mod loader's
+list. They are always on.
+
+### Linux (Steam Deck, desktop Linux)
+
+Coming soon: Setup will build the game on Linux, and you'll play it with
+Proton.
+
+## Requirements (manual build with setup.bat)
 
 - Your own Saints Row (Xbox 360) disc, dumped to an `.iso` file.
 - Windows 10 or 11 (64-bit) and a GPU with Direct3D 12 support.
