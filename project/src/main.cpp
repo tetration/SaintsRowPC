@@ -6,6 +6,7 @@
 #include <cstring>
 #include "world_studio_bridge.h"
 #include "online_integrity.h"
+#include "discord_presence.h"
 #include "saintsrow_config.h"
 #include "saintsrow_init.h"
 #include "fps_overlay.h"
@@ -71,6 +72,9 @@ extern "C" {
 __declspec(dllexport) DWORD NvOptimusEnablement = 0x00000001;
 __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 }
+
+// fast_fma.h (x86-64-v2 build): file "fma_crt" = always the C runtime's fma.
+extern "C" bool sr_fma_use_crt = false;
 
 // ============================================================================
 // Guest memory safety net
@@ -522,6 +526,18 @@ public:
         rex::RegisterLogLevelCallback();
         REXLOG_INFO("Saints Row starting");
         REXLOG_INFO("  Game directory: {}", game_dir.string());
+        if (FILE* ff = std::fopen("fma_crt", "rb")) {
+            std::fclose(ff);
+            sr_fma_use_crt = true;
+            REXLOG_INFO("fma: C runtime fma for every call (fma_crt)");
+        }
+        // Test aid: the C runtime's fma without FMA3, as on CPUs from 2012 and
+        // earlier (only matters for saintsrow_compat.exe).
+        if (FILE* sf = std::fopen("crt_fma_soft", "rb")) {
+            std::fclose(sf);
+            _set_FMA3_enable(0);
+            REXLOG_INFO("fma: C runtime FMA3 path off (crt_fma_soft)");
+        }
         {
             // What this PC has (weak laptops get lighter defaults, see hw_profile.h).
             const sr::HwProfile& hw = sr::GetHwProfile();
@@ -617,14 +633,33 @@ public:
             }
             sr::SetMouseSensitivity(sensitivity);
         }
-        // Online layer (in progress): a file named "xbox_live" next to the exe
-        // reports the profile as signed in to Xbox Live, so the game's Xbox
-        // Live menus (Quick / Custom Match, leaderboards) open. Research only
-        // until the Live calls are backed by Epic Online Services.
-        if (FILE* lf = std::fopen("xbox_live", "rb")) {
-            std::fclose(lf);
-            rex::cvar::SetFlagByName("xam_signed_in_to_live", "true");
-            REXLOG_INFO("Xbox Live sign-in: on (xbox_live)");
+        // Xbox Live sign-in: the game's Xbox Live menus (Quick / Custom Match,
+        // party, leaderboards) run over Epic Online Services, so the profile
+        // counts as signed in whenever online play (the Epic DLL from the
+        // online pack) is installed. A file named "xbox_live" forces it on,
+        // "xbox_live.off" forces it off.
+        {
+            auto exists = [](const char* path) {
+                if (FILE* f = std::fopen(path, "rb")) {
+                    std::fclose(f);
+                    return true;
+                }
+                return false;
+            };
+            const char* why = nullptr;
+            if (exists("xbox_live.off")) {
+                why = nullptr;
+            } else if (exists("xbox_live")) {
+                why = "xbox_live";
+            } else if (exists("core/WhompaysCoop/eos/EOSSDK-Win64-Shipping.dll")) {
+                why = "online play installed";
+            }
+            if (why) {
+                rex::cvar::SetFlagByName("xam_signed_in_to_live", "true");
+                REXLOG_INFO("Xbox Live sign-in: on ({})", why);
+            } else {
+                REXLOG_INFO("Xbox Live sign-in: off (no online play files, or xbox_live.off)");
+            }
         }
         // Player name (CO-OP tab > Player Name): player_name.txt next to the exe.
         if (FILE* nf = std::fopen("player_name.txt", "rb")) {
@@ -826,6 +861,8 @@ public:
         wml::Start(runtime_->memory()->virtual_membase());
         // Online fair play: modded or not, cheat-tool watch, online notices.
         sr::StartOnlineIntegrity(exe_dir);
+        // Discord status ("Playing Saints Reborn", what and how long).
+        sr::StartDiscordPresence(exe_dir, runtime_->memory()->virtual_membase());
 
         spdlog::default_logger()->flush();
 
